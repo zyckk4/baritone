@@ -39,6 +39,13 @@ jobs:
         git rev-parse HEAD > dist/source-commit.txt
         sha256sum dist/*.jar > dist/checksums-sha256.txt
 
+    - name: Verify official Fabric API compatibility
+      run: |
+        baseline="$RUNNER_TEMP/baritone-api-fabric-1.17.0.jar"
+        curl --fail --location --retry 3 --output "$baseline" https://github.com/cabaletta/baritone/releases/download/v1.17.0/baritone-api-fabric-1.17.0.jar
+        echo "a1646893c2a6338ea6bf1a3bdecf2cd743ede61e31a4324bd79a82f3d03360f9  $baseline" | sha256sum --check
+        python3 scripts/verify_api.py --baseline "$baseline" --candidate dist/baritone-api-fabric-*.jar --report dist/api-verification.json
+
     - name: Archive test reports
       if: always()
       uses: actions/upload-artifact@v7

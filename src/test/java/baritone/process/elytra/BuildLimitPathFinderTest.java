@@ -45,6 +45,19 @@ public class BuildLimitPathFinderTest {
     }
 
     @Test
+    public void verticalTransitionUsesFloorBasedChunkCentersAtNegativeBoundaries() {
+        int[] coordinates = {-33, -32, -17, -16, -1, 0, 15, 16, 31, 32};
+        int[] centers = {-40, -24, -24, -8, -8, 8, 8, 24, 24, 40};
+        for (int i = 0; i < coordinates.length; i++) {
+            BlockPos start = new BlockPos(coordinates[i], 300, coordinates[i]);
+            BlockPos waypoint = BuildLimitPathFinder.transitionUpWaypoint(start, start.above(50), 319);
+            assertEquals("X center at " + coordinates[i], centers[i], waypoint.getX());
+            assertEquals("Z center at " + coordinates[i], centers[i], waypoint.getZ());
+            assertEquals(335, waypoint.getY());
+        }
+    }
+
+    @Test
     public void distanceThresholdUsesBlocksAndIgnoresHeight() {
         BlockPos start = new BlockPos(-1000, 100, 2000);
         assertFalse(BuildLimitPathFinder.isBeyondHorizontalDistance(start, start.above(1000), 32));

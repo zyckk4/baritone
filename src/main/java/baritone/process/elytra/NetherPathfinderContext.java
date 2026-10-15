@@ -182,6 +182,8 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         }
         try {
             this.writeExecutor.execute(() -> {
+                UnpackedSegment result = null;
+                Throwable failure = null;
                 writeLock.lock();
                 try {
                     if (this.lifecycle.isClosed()) {
@@ -204,13 +206,24 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
                     if (this.lifecycle.isClosed()) {
                         throw new PathCalculationException("Pathfinder context closed");
                     }
-                    future.complete(new UnpackedSegment(UnpackedSegment.from(segment).collect().stream().map(pos -> pos.above(minY)), segment.finished));
+                    result = new UnpackedSegment(UnpackedSegment.from(segment).collect().stream().map(pos -> pos.above(minY)), segment.finished);
                 } catch (Throwable error) {
-                    future.completeExceptionally(error);
+                    failure = error;
                 } finally {
                     // Region imports may replace cached chunks. Never retain a Java chunk pointer across them.
                     this.boi.chunkPtr = 0L;
                     writeLock.unlock();
+                }
+                // Completion can immediately schedule a landing visibility check on the game thread.
+                // Publish only after releasing the writer, so a non-blocking reader does not mistake
+                // our completed search's lock for an obstructed approach. Invalidation may already
+                // have completed this future exceptionally; complete() then leaves that result intact.
+                if (failure != null) {
+                    future.completeExceptionally(failure);
+                } else if (this.lifecycle.isClosed()) {
+                    future.completeExceptionally(new PathCalculationException("Pathfinder context closed"));
+                } else {
+                    future.complete(result);
                 }
             });
         } catch (RejectedExecutionException error) {

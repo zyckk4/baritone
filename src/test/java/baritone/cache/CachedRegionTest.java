@@ -86,6 +86,7 @@ public class CachedRegionTest {
     @Test
     public void concurrentWritersUseDifferentTemporaryFiles() throws Exception {
         Path region = temporary.getRoot().toPath().resolve("r.0.0.bcr");
+        Files.write(region, new byte[]{0});
         CyclicBarrier bothWriting = new CyclicBarrier(2);
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
@@ -112,7 +113,9 @@ public class CachedRegionTest {
             byte[] contents = new byte[4096];
             java.util.Arrays.fill(contents, value);
             Files.write(pending, contents);
+            assertArrayEquals(new byte[]{0}, Files.readAllBytes(region));
             try {
+                // Both callbacks must run concurrently; publication must not hold a lock while writing.
                 barrier.await(5, TimeUnit.SECONDS);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();

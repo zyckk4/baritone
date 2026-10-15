@@ -152,9 +152,10 @@ public final class ElytraBehavior implements Helper {
     public final class PathManager {
 
         public NetherPath path;
-        private boolean completePath;
+        private final PathContinuationState continuation = new PathContinuationState();
         private boolean recalculating;
         private long generation;
+        private final DeferredPathApplication<Runnable> pendingApplication = new DeferredPathApplication<>();
 
         private int maxPlayerNear;
         private int ticksNearUnchanged;
@@ -196,31 +197,33 @@ public final class ElytraBehavior implements Helper {
         }
 
         public CompletableFuture<Void> pathToDestination(final BlockPos from) {
+            // A replacement request owns path calculation just like a segment repair. Otherwise a
+            // tick inspecting the old path can start another request and supersede a pending takeoff.
+            this.recalculating = true;
             final long start = System.nanoTime();
             return this.path0(from, destinationFixed(), UnaryOperator.identity())
                     .thenRun(() -> {
                         final double distance = this.path.get(0).distanceTo(this.path.get(this.path.size() - 1));
-                        if (this.completePath) {
+                        if (this.continuation.isComplete()) {
                             logVerbose(String.format("Computed path (%.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         } else {
                             logVerbose(String.format("Computed segment (Next %.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         }
                     })
-                    .whenCompleteAsync((result, ex) -> {
-                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
-                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                    .whenComplete((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ElytraAsyncFailure.isCancellation(ex)) {
                             return;
                         }
                         this.recalculating = false;
                         if (ex != null) {
-                            final Throwable cause = ex.getCause();
+                            final Throwable cause = ElytraAsyncFailure.unwrap(ex);
                             if (cause instanceof PathCalculationException) {
                                 logDirect("Failed to compute path to destination");
                             } else {
                                 logUnhandledException(cause);
                             }
                         }
-                    }, ctx.minecraft()::execute);
+                    });
         }
 
         public CompletableFuture<Void> pathRecalcSegment(final OptionalInt upToIncl) {
@@ -230,30 +233,31 @@ public final class ElytraBehavior implements Helper {
 
             this.recalculating = true;
             final List<BetterBlockPos> after = upToIncl.isPresent() ? this.path.subList(upToIncl.getAsInt() + 1, this.path.size()) : Collections.emptyList();
-            final boolean complete = this.completePath;
+            final boolean complete = this.continuation.isComplete();
 
             return this.path0(ctx.playerFeet(), upToIncl.isPresent() ? fixDestination(this.path.get(upToIncl.getAsInt())) : destinationFixed(),
                     segment -> segment.appendAfterRejoin(after.stream(), upToIncl.isPresent(), complete))
-                    .whenCompleteAsync((result, ex) -> {
-                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
-                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                    .whenComplete((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ElytraAsyncFailure.isCancellation(ex)) {
                             return;
                         }
                         this.recalculating = false;
                         if (ex != null) {
-                            final Throwable cause = ex.getCause();
+                            this.continuation.calculationFailed();
+                            final Throwable cause = ElytraAsyncFailure.unwrap(ex);
                             if (cause instanceof PathCalculationException) {
-                                logVerbose("Failed to recompute segment");
+                                logVerbose("Failed to recompute segment; retrying after "
+                                        + PathContinuationState.FAILURE_RETRY_TICKS + " ticks");
                                 repackNearPlayer("segment recomputation failed");
                             } else {
                                 logUnhandledException(cause);
                             }
                         }
-                    }, ctx.minecraft()::execute);
+                    });
         }
 
         public void pathNextSegment(final int afterIncl) {
-            if (this.recalculating) {
+            if (this.recalculating || !this.continuation.retryReady()) {
                 return;
             }
 
@@ -267,38 +271,36 @@ public final class ElytraBehavior implements Helper {
                         final int recompute = this.path.size() - before.size() - 1;
                         final double distance = recompute > 0 ? this.path.get(0).distanceTo(this.path.get(recompute)) : 0;
 
-                        if (this.completePath) {
+                        if (this.continuation.isComplete()) {
                             logVerbose(String.format("Computed path (%.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         } else {
                             logVerbose(String.format("Computed segment (Next %.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         }
                     })
-                    .whenCompleteAsync((result, ex) -> {
-                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
-                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                    .whenComplete((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ElytraAsyncFailure.isCancellation(ex)) {
                             return;
                         }
                         this.recalculating = false;
                         if (ex != null) {
-                            final Throwable cause = ex.getCause();
+                            this.continuation.calculationFailed();
+                            final Throwable cause = ElytraAsyncFailure.unwrap(ex);
                             if (cause instanceof PathCalculationException) {
-                                logVerbose("Failed to compute next segment");
+                                logVerbose("Path remains incomplete; retrying after "
+                                        + PathContinuationState.FAILURE_RETRY_TICKS + " ticks");
                                 repackNearPlayer("next segment computation failed");
-                                if (ctx.player().distanceToSqr(pathStart.getCenter()) < 16 * 16) {
-                                    logVerbose("Player is near the segment start, therefore repeating this calculation is pointless. Marking as complete");
-                                    completePath = true;
-                                }
                             } else {
                                 logUnhandledException(cause);
                             }
                         }
-                    }, ctx.minecraft()::execute);
+                    });
         }
 
         public void clear() {
             this.generation++;
+            this.pendingApplication.cancel();
             this.path = NetherPath.emptyPath();
-            this.completePath = true;
+            this.continuation.acceptPath(true);
             this.recalculating = false;
             this.playerNear = 0;
             this.ticksNearUnchanged = 0;
@@ -318,7 +320,7 @@ public final class ElytraBehavior implements Helper {
                 }
             }
             this.path = new NetherPath(path);
-            this.completePath = segment.isFinished();
+            this.continuation.acceptPath(segment.isFinished());
             this.playerNear = 0;
             this.ticksNearUnchanged = 0;
             this.maxPlayerNear = 0;
@@ -332,28 +334,47 @@ public final class ElytraBehavior implements Helper {
             return this.playerNear;
         }
 
-        // mickey resigned
         private CompletableFuture<Void> path0(BlockPos src, BlockPos dst, UnaryOperator<UnpackedSegment> operator) {
             if (ElytraBehavior.this.destroyed) {
                 return CompletableFuture.failedFuture(new CancellationException("Elytra behavior stopped"));
             }
-            final long request = ++this.generation;
-            return ElytraBehavior.this.pathFinder.pathFindAsync(src, dst)
-                    .handleAsync((segment, failure) -> {
-                        if (ElytraBehavior.this.destroyed || request != this.generation) {
-                            throw new CancellationException("Stale elytra path result");
-                        }
-                        if (failure != null) {
-                            throw failure instanceof CompletionException ? (CompletionException) failure : new CompletionException(failure);
-                        }
-                        this.setPath(operator.apply(segment));
-                        return null;
-                    }, ctx.minecraft()::execute);
+            final long generation = ++this.generation;
+            final DeferredPathApplication.Request<Runnable> request = this.pendingApplication.begin();
+            try {
+                ElytraBehavior.this.pathFinder.pathFindAsync(src, dst)
+                        .whenCompleteAsync((segment, failure) -> {
+                            if (ElytraBehavior.this.destroyed || generation != this.generation) {
+                                request.future().cancel(false);
+                                return;
+                            }
+                            this.pendingApplication.offer(request, () -> {
+                                if (ElytraBehavior.this.destroyed || generation != this.generation) {
+                                    throw new CancellationException("Stale elytra path application");
+                                }
+                                this.setPath(operator.apply(segment));
+                            }, failure);
+                            this.applyPendingPath();
+                        }, ctx.minecraft()::execute);
+            } catch (Exception failure) {
+                this.pendingApplication.offer(request, null, failure);
+                this.applyPendingPath();
+            }
+            return request.future();
+        }
+
+        private void applyPendingPath() {
+            if (ElytraBehavior.this.destroyed) {
+                this.pendingApplication.cancel();
+                return;
+            }
+            // A busy writer is retried by onTick; no recursive execute/resubmit loop. In particular,
+            // landing-point visibility must be tested under a read lease, never against a busy cache.
+            this.pendingApplication.drain(npfContext::tryAcquireReadLock, npfContext::releaseReadLock, Runnable::run);
         }
 
         // required read lock to be held
         private void pathfindAroundObstacles() {
-            if (this.recalculating) {
+            if (this.recalculating || !this.continuation.retryReady()) {
                 return;
             }
 
@@ -438,14 +459,14 @@ public final class ElytraBehavior implements Helper {
         }
 
         private void attemptNextSegment() {
-            if (this.recalculating) {
+            if (this.recalculating || !this.continuation.retryReady()) {
                 return;
             }
 
             final int last = this.path.size() - 1;
             final BetterBlockPos lastPos = this.path.get(this.path.size() - 1);
             // `ctx.world().isLoaded` cannot be used here as it returns false is the y-value is beyond the build limits.
-            if (!this.completePath && ctx.world().getChunkSource().hasChunk(lastPos.x >> 4,lastPos.z >> 4)) {
+            if (!this.continuation.isComplete() && ctx.world().getChunkSource().hasChunk(lastPos.x >> 4,lastPos.z >> 4)) {
                 this.pathNextSegment(last);
             }
         }
@@ -481,7 +502,7 @@ public final class ElytraBehavior implements Helper {
         }
 
         public boolean isComplete() {
-            return this.completePath;
+            return this.continuation.isComplete();
         }
     }
 
@@ -582,7 +603,13 @@ public final class ElytraBehavior implements Helper {
 
     /** Stop accepting work immediately, before asynchronous executor teardown begins. */
     public void invalidate() {
+        if (this.destroyed) return;
         this.destroyed = true;
+        if (ctx.minecraft().isSameThread()) {
+            this.pathManager.pendingApplication.cancel();
+        } else {
+            ctx.minecraft().execute(this.pathManager.pendingApplication::cancel);
+        }
         this.solveNextTick = false;
         if (this.solver != null) {
             this.solver.cancel(true);
@@ -606,6 +633,8 @@ public final class ElytraBehavior implements Helper {
         // These are game-tick clocks, not successful-cache-read clocks. Native searches can hold the
         // write lock for seconds, but a pending rocket prediction must still expire after ten ticks.
         this.updateTickState();
+        this.pathManager.applyPendingPath();
+        if (this.destroyed) return;
         if (npfContext.tryAcquireReadLock()) {
             try {
                 this.onTick0();
@@ -621,6 +650,8 @@ public final class ElytraBehavior implements Helper {
     }
 
     private void updateTickState() {
+        // Progress even while a native search holds the cache write lock.
+        this.pathManager.continuation.tick();
         this.solveNextTick = false;
         this.aimedThisTick = false;
         // Fetch the previous solution, regardless of if it's going to be used

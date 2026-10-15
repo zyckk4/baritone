@@ -45,6 +45,10 @@ public final class CachedRegion implements ICachedRegion {
     private static final byte CHUNK_NOT_PRESENT = 0;
     private static final byte CHUNK_PRESENT = 1;
 
+    // Windows can reject simultaneous replacement moves to the same file. Share this lock across
+    // region objects; only publication is serialized, not region serialization or compression.
+    private static final Object REGION_PUBLISH_LOCK = new Object();
+
     /**
      * Magic value to detect invalid cache files, or incompatible cache files saved in an old version of Baritone
      */
@@ -201,17 +205,20 @@ public final class CachedRegion implements ICachedRegion {
 
     /**
      * Publish a complete region only after its streams have closed. Native cache readers may read the
-     * destination concurrently. Unique temporary names also separate writers within the same process;
-     * concurrent saves resolve to last-complete-writer-wins.
+     * destination concurrently. Unique temporary names separate writers, and publication is serialized
+     * across region objects in this class loader. Concurrent saves resolve to last-published-writer-wins.
+     * Separate JVMs are not serialized by this lock; they rely on the filesystem's atomic move support.
      */
     static void writeAtomically(Path regionFile, RegionWriter writer) throws IOException {
         Path tmpFile = Files.createTempFile(regionFile.toAbsolutePath().getParent(), regionFile.getFileName() + ".", ".tmp");
         try {
             writer.write(tmpFile);
-            try {
-                Files.move(tmpFile, regionFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ex) {
-                Files.move(tmpFile, regionFile, StandardCopyOption.REPLACE_EXISTING);
+            synchronized (REGION_PUBLISH_LOCK) {
+                try {
+                    Files.move(tmpFile, regionFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ex) {
+                    Files.move(tmpFile, regionFile, StandardCopyOption.REPLACE_EXISTING);
+                }
             }
         } finally {
             Files.deleteIfExists(tmpFile);

@@ -1499,7 +1499,7 @@ public final class Settings {
 
     /**
      * When {@link #elytraAutoJump} can't find a ledge to walk off of, jump on the spot and light a firework the
-     * tick after the elytra opens instead of giving up. Costs one firework per attempt.
+     * tick after the elytra opens instead of giving up. Each attempt may consume fireworks.
      */
     public final Setting<Boolean> elytraStandingTakeoff = new Setting<>(true);
 

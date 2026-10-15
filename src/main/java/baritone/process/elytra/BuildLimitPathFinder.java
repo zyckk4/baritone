@@ -136,9 +136,12 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
         final double deltaZ = (double) destination.getZ() - start.getZ();
         final double distance = Math.hypot(deltaX, deltaZ);
         final double scale = distance == 0 ? 0 : 16 / distance;
-        final BlockPos middle = new ChunkPos(start).getMiddleBlockPosition(maxHeight + 16);
-        return new BetterBlockPos((int) (middle.getX() + deltaX * scale), maxHeight + 16,
-                (int) (middle.getZ() + deltaZ * scale));
+        // Arithmetic right shift floors negative coordinates to their chunk, just as ChunkPos does.
+        // Keep this geometry independent of ChunkPos's registry-dependent static initialization.
+        final int middleX = ((start.getX() >> 4) << 4) + 8;
+        final int middleZ = ((start.getZ() >> 4) << 4) + 8;
+        return new BetterBlockPos((int) (middleX + deltaX * scale), maxHeight + 16,
+                (int) (middleZ + deltaZ * scale));
     }
 
     static boolean isBeyondHorizontalDistance(BlockPos start, BlockPos destination, double threshold) {

@@ -380,14 +380,17 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     );
                     final ElytraBehavior takeoffBehavior = this.behavior;
                     this.state = State.PAUSE;
-                    takeoffBehavior.pathManager.pathToDestination(from).whenCompleteAsync((result, ex) -> {
+                    // PathManager completes on the game thread. Advance inline so a newer request
+                    // cannot start between its generation check and this state transition.
+                    takeoffBehavior.pathManager.pathToDestination(from).whenComplete((result, ex) -> {
                         if (this.behavior != takeoffBehavior || this.state != State.PAUSE) return;
+                        if (ElytraAsyncFailure.isCancellation(ex)) return;
                         if (ex == null) {
                             this.state = State.GET_TO_JUMP;
                             return;
                         }
                         onLostControl();
-                    }, ctx.minecraft()::execute);
+                    });
                 } else {
                     return standingTakeoff();
                 }
@@ -513,14 +516,18 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // handful of ticks between opening the elytra and hitting the ground is no time to compute one
         this.state = State.PAUSE;
         final ElytraBehavior takeoffBehavior = this.behavior;
-        takeoffBehavior.pathManager.pathToDestination(exit != null ? exit : feet).whenCompleteAsync((result, ex) -> {
+        // Keep this inline with PathManager's game-thread completion and generation check.
+        takeoffBehavior.pathManager.pathToDestination(exit != null ? exit : feet).whenComplete((result, ex) -> {
             if (this.behavior != takeoffBehavior || this.state != State.PAUSE) return;
+            // Lava recovery can supersede this request while still grounded in PAUSE. A stale path is
+            // cancellation of that old request, not a failure of the new flight/recovery request.
+            if (ElytraAsyncFailure.isCancellation(ex)) return;
             if (ex == null) {
                 this.state = State.TAKEOFF_JUMP;
                 return;
             }
             onLostControl();
-        }, ctx.minecraft()::execute);
+        });
         return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
     }
 

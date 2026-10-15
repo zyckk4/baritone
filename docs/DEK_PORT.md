@@ -30,8 +30,12 @@
 | 线程与分配 | `a3ffadc0`, `712b065d`, `ee7c6d91` | 工具/水面行走状态快照、线程安全工具缓存、可见取消标志及减少每 tick 分配 |
 
 本次还对移植接缝做了小范围修正：工具栈使用 `copy()`；缓存临时文件每次唯一；修正官方对角线第二个角的 magma 判定引用。
+缓存压缩仍可并行，最后的文件替换在同一类加载器内串行执行，避免 Windows 上两个 region 对象同时发布同一文件时发生冲突。
 世界高度检查保留玩家脚部节点可站在最高方块顶面的语义。
 官方高空路径还修正了垂直目标的除零问题；无法找到下降通道时返回未完成片段，避免直接连接尚不可达的低空终点。
+后续片段计算失败时也保持“未完成”，等待 20 个游戏 tick 后重试，不会误触发目标到达、降落或 `disconnectOnArrival`。
+起飞请求及成功/失败回调受当前请求归属约束；旧请求被替换时不能取消新任务。
+路径结果应用和落点检查共用读锁；缓存正在写入时延至后续游戏 tick，避免将锁忙误判为地形阻挡。
 
 ## 保留的官方功能
 
@@ -66,6 +70,23 @@ $env:JAVA_HOME = 'C:\path\to\jdk-21'
 完整构建使用 `./gradlew build`。fork 的版本由 `gradle.properties` 中 `mod_version` 决定，
 可通过 `-Pmod_version=...` 覆盖，不会误用继承来的官方 Git tag。
 GitHub Actions 构件版本追加来源提交短 SHA，并上传测试报告、`source-commit.txt` 和 SHA-256 清单。
+CI 还使用固定 SHA-256 的官方 v1.17.0 Fabric API JAR 检查公开 API、加载器元数据和嵌入的 native 1.6。
+
+本地 Windows / Java 21 验证结果（2026-10-15）：
+
+- 全部 **89 项测试通过**，0 失败、0 错误、0 跳过。
+- Fabric API、standalone、unoptimized 三种 JAR 完成 remap、优化和打包。
+- JNI 测试实际加载 native 1.6，覆盖三个维度高度和两种分配器的合成区块读写、射线、寻路、裁剪及释放；不涉及真实游戏世界。
+
+可复现二进制 API 检查（Python 3，无第三方依赖）：
+
+```powershell
+python scripts/verify_api.py --baseline path/to/baritone-api-fabric-1.17.0.jar --candidate dist/baritone-api-fabric-1.17.0-2b2t.1.jar --report dist/api-verification.json
+```
+
+官方基线下载自 [v1.17.0 release](https://github.com/cabaletta/baritone/releases/tag/v1.17.0)，
+SHA-256 为 `a1646893c2a6338ea6bf1a3bdecf2cd743ede61e31a4324bd79a82f3d03360f9`。
+工具比较公开类及 public/protected 成员描述符、可见性、继承关系和泛型签名，并核对 Java 21、Minecraft 1.21.11、保留设置及 native 内容；这不能替代 Meteor/addon 实际加载测试。
 
 验证必须区分：源码审查、单元/离线原生检查、构建产物，以及真实游戏/服务器。
 **本次没有登录 2b2t；不宣称 Grim 接受率、长途稳定性、飞行速度或实际脱困成功率已经验收。**
