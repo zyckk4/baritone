@@ -1,5 +1,17 @@
 # Baritone
 
+> **Minecraft 1.21.11 · zyckk4 2b2t fork**
+>
+> 基于官方 `cabaletta/baritone` 的 1.21.11 分支（`v1.17.0`），选择性移植 Dekrom
+> `v1.3.0-1.21.11` 的飞行恢复、烟花时序、缓存和寻路修复。
+> 保留官方的多维度鞘翅寻路、`elytraUseCache`、`IElytraProcess.getPath()` 和 native 1.6。
+> 改动范围、来源、使用方法与验证边界见 [移植说明](docs/DEK_PORT.md)。
+>
+> Meteor / addon 用户使用构建产物中的 **`baritone-api-fabric-*.jar`**，Minecraft 版本必须为
+> **1.21.11**，Java 为 **21**。同一实例只保留一个 Baritone JAR。
+> CI 构建可从本仓库 [Actions](https://github.com/zyckk4/baritone/actions) 的 `Artifacts` 下载。
+> 此 fork 不代表官方 Baritone 或 Dekrom；构建和离线测试不等于当前 2b2t / Grim 实服验收。
+
 <p align="center">
   <a href="https://github.com/cabaletta/baritone/releases/"><img src="https://img.shields.io/github/downloads/cabaletta/baritone/total.svg" alt="GitHub All Releases"/></a>
 </p>

@@ -1446,6 +1446,13 @@ public final class Settings {
     public final Setting<Integer> elytraPitchRange = new Setting<>(25);
 
     /**
+     * The number of path nodes ahead of the player that are considered as flight targets. Higher values let the bot
+     * commit to a further-away node and cut corners, which is smoother at firework speed, but are computationally
+     * more expensive.
+     */
+    public final Setting<Integer> elytraPathLookahead = new Setting<>(20);
+
+    /**
      * The minimum speed that the player can drop to (in blocks/tick) before a firework is automatically deployed.
      */
     public final Setting<Double> elytraFireworkSpeed = new Setting<>(1.2);
@@ -1489,6 +1496,12 @@ public final class Settings {
      * Automatically path to and jump off of ledges to initiate elytra flight when grounded.
      */
     public final Setting<Boolean> elytraAutoJump = new Setting<>(false);
+
+    /**
+     * When {@link #elytraAutoJump} can't find a ledge to walk off of, jump on the spot and light a firework the
+     * tick after the elytra opens instead of giving up. Costs one firework per attempt.
+     */
+    public final Setting<Boolean> elytraStandingTakeoff = new Setting<>(true);
 
     /**
      * The seed used to generate chunks for long distance elytra path-finding in the nether.

@@ -216,7 +216,7 @@ public interface MovementHelper extends ActionCosts, Helper {
                 return false;
             }
             // Everything after this point has to be a special case as it relies on the water not being flowing, which means a special case is needed.
-            if (Baritone.settings().assumeWalkOnWater.value) {
+            if (bsi.assumeWalkOnWater) {
                 return false;
             }
 
@@ -224,7 +224,9 @@ public interface MovementHelper extends ActionCosts, Helper {
             if (!up.getFluidState().isEmpty() || up.getBlock() instanceof WaterlilyBlock) {
                 return false;
             }
-            return fluidState.getType() instanceof WaterFluid;
+            // a waterlogged block (fence, wall, pane, bars, stairs, leaves...) keeps its own collision,
+            // so it's only passable if the block itself is
+            return fluidState.getType() instanceof WaterFluid && state.isPathfindable(PathComputationType.LAND);
         }
 
         return state.isPathfindable(PathComputationType.LAND);
@@ -234,6 +236,11 @@ public interface MovementHelper extends ActionCosts, Helper {
         Block block = state.getBlock();
         if (block instanceof AirBlock) { // early return for most common case
             return YES;
+        }
+        // the player hitbox is the same width in the air as on the ground, so anything we can't walk
+        // through we can't jump through either (powder snow, honey, berry bushes, dripstone, blocksToAvoid...)
+        if (canWalkThroughBlockState(state) == NO) {
+            return NO;
         }
         // exceptions - blocks that are isPassable true, but we can't actually jump through
         if (block instanceof BaseFireBlock
@@ -458,11 +465,11 @@ public interface MovementHelper extends ActionCosts, Helper {
             }
             if (MovementHelper.isFlowing(x, y, z, state, bsi) || upState.getFluidState().getType() == Fluids.FLOWING_WATER) {
                 // the only scenario in which we can walk on flowing water is if it's under still water with jesus off
-                return isWater(upState) && !Baritone.settings().assumeWalkOnWater.value;
+                return isWater(upState) && !bsi.assumeWalkOnWater;
             }
             // if assumeWalkOnWater is on, we can only walk on water if there isn't water above it
             // if assumeWalkOnWater is off, we can only walk on water if there is water above it
-            return isWater(upState) ^ Baritone.settings().assumeWalkOnWater.value;
+            return isWater(upState) ^ bsi.assumeWalkOnWater;
         }
 
         if (MovementHelper.isLava(state) && !MovementHelper.isFlowing(x, y, z, state, bsi) && Baritone.settings().assumeWalkOnLava.value) { // if we get here it means that assumeWalkOnLava must be true, so put it last

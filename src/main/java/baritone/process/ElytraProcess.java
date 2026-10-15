@@ -25,7 +25,6 @@ import baritone.api.event.listener.AbstractGameEventListener;
 import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.pathing.goals.GoalXZ;
-import baritone.api.pathing.goals.GoalYLevel;
 import baritone.api.pathing.movement.IMovement;
 import baritone.api.pathing.path.IPathExecutor;
 import baritone.api.process.IBaritoneProcess;
@@ -37,6 +36,7 @@ import baritone.api.utils.Rotation;
 import baritone.api.utils.RotationUtils;
 import baritone.api.utils.input.Input;
 import baritone.pathing.movement.CalculationContext;
+import baritone.pathing.movement.MovementHelper;
 import baritone.pathing.movement.movements.MovementFall;
 import baritone.process.elytra.*;
 import baritone.utils.BaritoneProcessHelper;
@@ -47,6 +47,7 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.NonNullList;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -75,11 +76,28 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private Goal goal;
     private ElytraBehavior behavior;
     private NetherPathfinderContext npfContext;
+    private BlockPos pendingDestination;
+    private boolean pendingAppendDestination;
     private boolean predictingTerrain;
     private boolean allowTight;
     private boolean allowAboveBuildLimit;
     private boolean allowAboveRoof;
     private final Semaphore npfSema = new Semaphore(1);
+
+    private static final int TAKEOFF_MIN_FALL_HEIGHT = TakeoffGoal.MIN_FALL_HEIGHT;
+    private static final int TAKEOFF_STALL_TICKS = 60;
+    private static final int STANDING_TAKEOFF_TIMEOUT_TICKS = 40;
+    private static final int MAX_STANDING_TAKEOFFS = 3;
+    private static final int MAX_WALK_OFF_ATTEMPTS = 2;
+    private static final int TAKEOFF_MAX_EXIT_HEIGHT = 32;
+    private int takeoffStallTicks;
+    private int standingTakeoffs;
+    private int walkOffAttempts;
+    private int takeoffAirborneTicks;
+    private boolean walkOffImpossible;
+    private boolean takeoffBoostPending;
+    private int takeoffOpenedTicksAgo = -1;
+    private boolean lavaPathRequested;
 
     private static final int SHORT_LANDING_COLUMN_HEIGHT = 15;
     private static final int LONG_LANDING_COLUMN_HEIGHT = 39;
@@ -100,6 +118,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.landingSearchState = null;
         this.reachedGoal = false;
         this.goal = null;
+        this.pendingDestination = null;
+        this.takeoffStallTicks = 0;
+        this.standingTakeoffs = 0;
+        this.walkOffAttempts = 0;
+        this.takeoffAirborneTicks = 0;
+        this.walkOffImpossible = false;
+        this.takeoffBoostPending = false;
+        this.takeoffOpenedTicksAgo = -1;
+        this.lavaPathRequested = false;
         destroyBehaviorAsync();
         if (destroyNpf) {
             destroyNpfContextAsync();
@@ -119,7 +146,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     @Override
     public boolean isActive() {
-        return this.behavior != null;
+        return this.behavior != null || this.pendingDestination != null;
     }
 
     @Override
@@ -132,35 +159,47 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
     }
 
-    private static final String AUTO_JUMP_FAILURE_MSG = "Failed to compute a walking path to a spot to jump off from. Consider starting from a higher location, near an overhang. Or, you can disable elytraAutoJump and just manually begin gliding.";
+    private static final String TAKEOFF_ADVICE_MSG = "Consider starting from a higher location, near an overhang. Or, you can disable elytraAutoJump and just manually begin gliding.";
+    private static final String AUTO_JUMP_FAILURE_MSG = "Failed to compute a walking path to a spot to jump off from. " + TAKEOFF_ADVICE_MSG;
 
     @Override
     public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
+        if (this.behavior == null) {
+            tryStartPendingFlight();
+            if (this.behavior == null) {
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
+        }
         try {
             final long seedSetting = Baritone.settings().elytraNetherSeed.value;
             if (seedSetting != this.behavior.npfContext.getSeed()) {
                 logDirect("Nether seed changed, recalculating path");
                 this.resetState();
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
             if (predictingTerrain != Baritone.settings().elytraPredictTerrain.value && ctx.player().level().dimension() == Level.NETHER) {
                 logDirect("elytraPredictTerrain setting changed, recalculating path from scratch");
                 predictingTerrain = Baritone.settings().elytraPredictTerrain.value;
                 this.resetState();
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
             if (allowTight != Baritone.settings().elytraAllowTightSpaces.value) {
                 logDirect("elytraAllowTightSpaces setting changed, recalculating path from scratch");
                 allowTight = Baritone.settings().elytraAllowTightSpaces.value;
                 this.resetState();
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
             if (allowAboveBuildLimit != Baritone.settings().elytraAllowAboveBuildLimit.value) {
                 logDirect("elytraAllowAboveBuildLimit setting changed, recalculating path from scratch");
                 allowAboveBuildLimit = Baritone.settings().elytraAllowAboveBuildLimit.value;
                 this.resetState();
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
             if (allowAboveRoof != Baritone.settings().elytraAllowAboveRoof.value && ctx.player().level().dimension() == Level.NETHER) {
                 logDirect("elytraAllowAboveRoof setting changed, recalculating path from scratch");
                 allowAboveRoof = Baritone.settings().elytraAllowAboveRoof.value;
                 this.resetState();
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
         } catch (IllegalArgumentException e) {
             logDirect(e.getMessage(), ChatFormatting.RED);
@@ -169,14 +208,24 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
         this.behavior.onTick();
 
+        if (!ctx.player().isFallFlying() && ctx.player().isInLava()) {
+            return lavaTakeoff();
+        }
+
         if (calcFailed) {
+            if (this.state == State.LOCATE_JUMP || this.state == State.GET_TO_JUMP) {
+                return standingTakeoff();
+            }
             onLostControl();
             logDirect(AUTO_JUMP_FAILURE_MSG);
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
 
+        // No landing business while in lava. The solver is busy climbing out, and every path the landing search
+        // asks for from in here starts inside the pool and fails at once, which used to re-issue one every tick.
+        final boolean inLava = ctx.player().isInLava();
         boolean safetyLanding = false;
-        if (ctx.player().isFallFlying() && shouldLandForSafety()) {
+        if (ctx.player().isFallFlying() && !inLava && shouldLandForSafety()) {
             if (Baritone.settings().elytraAllowEmergencyLand.value) {
                 logDirect("Emergency landing - almost out of elytra durability or fireworks");
                 safetyLanding = true;
@@ -184,7 +233,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 logDirect("almost out of elytra durability or fireworks, but I'm going to continue since elytraAllowEmergencyLand is false");
             }
         }
-        if (ctx.player().isFallFlying() && this.state != State.LANDING && (this.behavior.pathManager.isComplete() || safetyLanding)) {
+        if (ctx.player().isFallFlying() && !inLava && this.state != State.LANDING && (this.behavior.pathManager.isComplete() || safetyLanding)) {
             final BetterBlockPos last = this.behavior.pathManager.path.getLast();
             if (last != null && (ctx.player().position().distanceToSqr(last.getCenter()) < (48 * 48) || safetyLanding) && (!goingToLandingSpot || (safetyLanding && this.landingSpot == null))) {
                 if (this.landingSearchState == null) {
@@ -240,12 +289,26 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         if (ctx.player().isFallFlying()) {
+            if (this.state == State.TAKEOFF_JUMP) {
+                this.state = State.START_FLYING;
+                this.takeoffStallTicks = 0;
+                this.takeoffBoostPending = true;
+                this.takeoffOpenedTicksAgo = 0;
+            }
+            if (this.takeoffOpenedTicksAgo >= 0) {
+                this.takeoffOpenedTicksAgo++;
+            }
             behavior.landingMode = this.state == State.LANDING;
             this.goal = null;
             baritone.getInputOverrideHandler().clearAllKeys();
             if (this.behavior.npfContext.tryAcquireReadLock()) {
                 try {
                     behavior.tick();
+                    // The START_FALL_FLYING request was sent on the previous tick. Use only after the
+                    // solver has chosen the rotation that the current movement packet will carry.
+                    if (this.takeoffBoostPending && this.behavior.useFireworkForTakeoff()) {
+                        this.takeoffBoostPending = false;
+                    }
                 } finally {
                     this.behavior.npfContext.releaseReadLock();
                 }
@@ -263,10 +326,22 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
 
+        if (this.takeoffOpenedTicksAgo >= 0) {
+            // The glide ended soon after takeoff. This can indicate a server rejection; it is not an
+            // acknowledgement of whether the server accepted a rocket.
+            if (!ctx.player().onGround()) {
+                logDirect("The elytra closed " + this.takeoffOpenedTicksAgo + " ticks after takeoff.");
+            }
+            this.takeoffOpenedTicksAgo = -1;
+        }
+
         if (this.state == State.FLYING || this.state == State.START_FLYING) {
-            this.state = ctx.player().onGround() && Baritone.settings().elytraAutoJump.value
-                    ? State.LOCATE_JUMP
-                    : State.START_FLYING;
+            if (ctx.player().onGround() && Baritone.settings().elytraAutoJump.value) {
+                this.state = State.LOCATE_JUMP;
+                this.takeoffStallTicks = 0;
+            } else {
+                this.state = State.START_FLYING;
+            }
         }
 
         if (this.state == State.LOCATE_JUMP) {
@@ -275,11 +350,24 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 onLostControl();
                 return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
-            if (this.goal == null) {
-                this.goal = new GoalYLevel(31);
+            if (this.walkOffImpossible) {
+                // there is nothing to walk off of around here, and we already spent a couple of seconds of
+                // pathfinding finding that out once
+                return standingTakeoff();
             }
-            final IPathExecutor executor = baritone.getPathingBehavior().getCurrent();
-            if (executor != null && executor.getPath().getGoal() == this.goal) {
+            if (this.goal == null) {
+                this.goal = takeoffGoal();
+            }
+            IPathExecutor executor = baritone.getPathingBehavior().getCurrent();
+            if (executor != null && executor.getPath().getGoal() != this.goal) {
+                // a segment left over from whatever we were doing before takeoff. it can never finish while we're
+                // pausing pathing, and while it exists secretInternalSetGoalAndPath refuses to start the walk off
+                // calculation, so neither side of this ever moves unless we drop it here
+                baritone.getPathingBehavior().secretInternalSegmentCancel();
+                executor = null;
+            }
+            if (executor != null) {
+                this.takeoffStallTicks = 0;
                 final IMovement fall = executor.getPath().movements().stream()
                         .filter(movement -> movement instanceof MovementFall)
                         .findFirst().orElse(null);
@@ -290,19 +378,25 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                             (fall.getSrc().y + fall.getDest().y) / 2,
                             (fall.getSrc().z + fall.getDest().z) / 2
                     );
-                    behavior.pathManager.pathToDestination(from).whenComplete((result, ex) -> {
+                    final ElytraBehavior takeoffBehavior = this.behavior;
+                    this.state = State.PAUSE;
+                    takeoffBehavior.pathManager.pathToDestination(from).whenCompleteAsync((result, ex) -> {
+                        if (this.behavior != takeoffBehavior || this.state != State.PAUSE) return;
                         if (ex == null) {
                             this.state = State.GET_TO_JUMP;
                             return;
                         }
                         onLostControl();
-                    });
-                    this.state = State.PAUSE;
+                    }, ctx.minecraft()::execute);
                 } else {
-                    onLostControl();
-                    logDirect(AUTO_JUMP_FAILURE_MSG);
-                    return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+                    return standingTakeoff();
                 }
+            } else if (baritone.getPathingBehavior().getInProgress().isPresent()) {
+                this.takeoffStallTicks = 0;
+            } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
+                // no path and nothing being calculated: SET_GOAL_AND_PAUSE has already decided it has nothing to
+                // do, so the executor we're waiting on is never going to appear
+                return standingTakeoff();
             }
             return new PathingCommandContext(this.goal, PathingCommandType.SET_GOAL_AND_PAUSE, new WalkOffCalculationContext(baritone));
         }
@@ -310,6 +404,30 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // yucky
         if (this.state == State.PAUSE) {
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        if (this.state == State.TAKEOFF_JUMP) {
+            if (++this.takeoffStallTicks > STANDING_TAKEOFF_TIMEOUT_TICKS) {
+                return abortTakeoff(ctx.player().onGround()
+                        ? "Couldn't get off the ground. "
+                        : "Got into the air but the elytra wouldn't open. ");
+            }
+            baritone.getInputOverrideHandler().clearAllKeys();
+            if (ctx.player().onGround()) {
+                // an ordinary jump. vanilla physics, and the movement packets it produces are what the server
+                // checks its own idea of onGround against before it will accept the request below
+                this.takeoffAirborneTicks = 0;
+                baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+            } else if (this.takeoffAirborneTicks++ > 0) {
+                // the second press of the double tap. openElytra() is what actually opens it, but the client
+                // reports every change of the key to the server (ServerboundPlayerInputPacket), so the inputs it
+                // sees are the ones a player who opens an elytra sends: press, release, press
+                baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                if (openElytra()) {
+                    this.state = State.START_FLYING;
+                }
+            }
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
 
         if (this.state == State.GET_TO_JUMP) {
@@ -321,8 +439,23 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     && executor.getPath().movements().get(executor.getPosition()) instanceof MovementFall;
 
             if (canStartFlying) {
+                this.takeoffStallTicks = 0;
                 this.state = State.START_FLYING;
             } else {
+                if (executor != null || baritone.getPathingBehavior().getInProgress().isPresent()) {
+                    this.takeoffStallTicks = 0;
+                } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
+                    // the walk off path ran out without us ever falling off it, either because we reached the goal
+                    // by stepping down or because the segment got cancelled. PathingBehavior won't re-path once
+                    // it considers the goal met, so go pick a new ledge instead of standing here
+                    if (++this.walkOffAttempts >= MAX_WALK_OFF_ATTEMPTS) {
+                        return standingTakeoff();
+                    }
+                    this.takeoffStallTicks = 0;
+                    this.goal = null;
+                    this.state = State.LOCATE_JUMP;
+                    return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+                }
                 return new PathingCommand(null, PathingCommandType.SET_GOAL_AND_PATH);
             }
         }
@@ -341,6 +474,164 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
     }
 
+    /**
+     * Takes off from where we are standing: jump, open the elytra on the way up, and light a firework on the
+     * following tick, since a glide that starts with no speed a block and a half off the floor only ends one way. This
+     * is what flat terrain leaves us with, where {@link WalkOffCalculationContext} has no ledge to offer and the
+     * alternative is standing around telling the user to go find a cliff.
+     */
+    private PathingCommand standingTakeoff() {
+        this.walkOffImpossible = true;
+        this.goal = null;
+        this.takeoffStallTicks = 0;
+        this.takeoffAirborneTicks = 0;
+        baritone.getPathingBehavior().secretInternalSegmentCancel();
+
+        if (!Baritone.settings().elytraStandingTakeoff.value) {
+            return abortTakeoff("There is no spot to jump off from, and elytraStandingTakeoff is off. ");
+        }
+        if (this.standingTakeoffs >= MAX_STANDING_TAKEOFFS) {
+            return abortTakeoff("Took off from here " + this.standingTakeoffs + " times and ended up back on the ground every time. ");
+        }
+        final BetterBlockPos feet = ctx.playerFeet();
+        if (!MovementHelper.fullyPassable(ctx, feet.above(2)) || !MovementHelper.fullyPassable(ctx, feet.above(3))) {
+            return abortTakeoff("There is no spot to jump off from, and not enough room above me to jump and open the elytra. ");
+        }
+        if (!this.behavior.selectFirework()) {
+            return abortTakeoff("There is no spot to jump off from, and no fireworks in my hotbar to take off from here with. ");
+        }
+        if (this.standingTakeoffs++ == 0) {
+            logDirect("No spot to jump off from, taking off from here instead.");
+        }
+        // The path starts from the first clear cube straight above us, which is where a climb on the takeoff
+        // rocket comes out. In a basalt delta crevice or the hollow beside a lava pond the walls are a couple of
+        // blocks away on every side, and up is the one direction that is reliably clear. Left to itself the
+        // pathfinder would start from the nearest clear cube to our feet, and its search for one ignores walls:
+        // from a hole that is very often a cube on the far side of one, which nothing here could ever reach.
+        final BetterBlockPos exit = takeoffExit(feet);
+        // the elytra path has to exist before we leave the ground: the behavior does nothing without one, and the
+        // handful of ticks between opening the elytra and hitting the ground is no time to compute one
+        this.state = State.PAUSE;
+        final ElytraBehavior takeoffBehavior = this.behavior;
+        takeoffBehavior.pathManager.pathToDestination(exit != null ? exit : feet).whenCompleteAsync((result, ex) -> {
+            if (this.behavior != takeoffBehavior || this.state != State.PAUSE) return;
+            if (ex == null) {
+                this.state = State.TAKEOFF_JUMP;
+                return;
+            }
+            onLostControl();
+        }, ctx.minecraft()::execute);
+        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+    }
+
+    /**
+     * We are in lava and the elytra is not open. Whatever the ground states were doing can wait: an elytra opens
+     * in lava (vanilla only refuses in water), and a rocket lit looking straight up is what gets us out. Swimming
+     * is far too slow, and since vanilla moves us by the fluid rules while we are in one, glide or not, the
+     * rocket is the only thrust there is and keeps a fraction of its usual push. Pointing it at the pool's wall
+     * would spend all of that on basalt, so once the elytra is open {@link ElytraBehavior} aims straight up and
+     * keeps lighting rockets until we are out.
+     */
+    private PathingCommand lavaTakeoff() {
+        baritone.getPathingBehavior().secretInternalSegmentCancel();
+        baritone.getInputOverrideHandler().clearAllKeys();
+        // swimming up: slow, but it also lifts us off the pool floor, without which the elytra can't open
+        baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+        if (this.behavior.pathManager.getPath().isEmpty() && !this.lavaPathRequested) {
+            // nothing to fly along once we're out; the takeoff states would have computed this
+            this.lavaPathRequested = true;
+            final BetterBlockPos feet = ctx.playerFeet();
+            final BetterBlockPos exit = takeoffExit(feet);
+            this.behavior.pathManager.pathToDestination(exit != null ? exit : feet);
+        }
+        if (!ctx.player().onGround() && openElytra()) {
+            this.state = State.START_FLYING;
+            this.takeoffStallTicks = 0;
+        }
+        return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+    }
+
+    /**
+     * The centre of the first 4x4x4 cube of air straight above {@code feet}, aligned the way the elytra
+     * pathfinder aligns its nodes, or {@code null} if there is none within {@link #TAKEOFF_MAX_EXIT_HEIGHT}.
+     */
+    private BetterBlockPos takeoffExit(BetterBlockPos feet) {
+        final int minY = ctx.world().dimensionType().minY();
+        final boolean roofLimited = ctx.world().dimension() == Level.NETHER && !Baritone.settings().elytraAllowAboveRoof.value;
+        int maxY = minY + this.npfContext.getMaxHeight();
+        if (Baritone.settings().elytraAllowAboveBuildLimit.value && !roofLimited) {
+            maxY = Math.max(maxY, feet.y + TAKEOFF_MAX_EXIT_HEIGHT + 4);
+        }
+        final int limit = Math.min(feet.y + TAKEOFF_MAX_EXIT_HEIGHT, maxY - 4);
+        final int ox = feet.x & ~3;
+        final int oz = feet.z & ~3;
+        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
+        cubes:
+        for (int oy = feet.y & ~3; oy <= limit; oy += 4) {
+            for (int x = ox; x < ox + 4; x++) {
+                for (int y = oy; y < oy + 4; y++) {
+                    for (int z = oz; z < oz + 4; z++) {
+                        mut.set(x, y, z);
+                        if (y < minY || !ctx.world().hasChunkAt(mut) || !ctx.world().getBlockState(mut).isAir()) {
+                            continue cubes;
+                        }
+                    }
+                }
+            }
+            return new BetterBlockPos(ox + 2, oy + 2, oz + 2);
+        }
+        return null;
+    }
+
+    /**
+     * Opens the elytra mid jump, exactly the way {@link net.minecraft.client.player.LocalPlayer} does it when a
+     * player double taps jump: set the flag locally, then tell the server. Doing it here instead of by toggling
+     * the jump key means it doesn't hang on the key going up and back down on precisely the right ticks, and it
+     * is the same thing on the wire either way - the server has already been sent the movement packets from an
+     * ordinary jump, so it agrees we are off the ground by the time the request reaches it.
+     *
+     * @return {@code true} if the elytra is now open
+     */
+    private boolean openElytra() {
+        if (!ctx.player().tryToStartFallFlying()) {
+            return false;
+        }
+        ctx.player().connection.send(new ServerboundPlayerCommandPacket(ctx.player(), ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+        // The rocket goes next tick, once the solver has aimed. A vanilla client cannot use an item in the tick
+        // it starts gliding (its use packets go out before its glide packet, while the elytra is still shut),
+        // and the use packet carries a look that has to match that tick's movement packet, which the solver
+        // has not decided yet. The tick costs nothing: the rocket takes a round trip to show up regardless.
+        this.takeoffBoostPending = true;
+        this.takeoffOpenedTicksAgo = 0;
+        return true;
+    }
+
+    private PathingCommand abortTakeoff(String reason) {
+        onLostControl();
+        logDirect(reason + TAKEOFF_ADVICE_MSG);
+        return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+    }
+
+    /**
+     * Where to walk to in order to take off.
+     * <p>
+     * {@link WalkOffCalculationContext} only offers single steps and falls of at least
+     * {@link #TAKEOFF_MIN_FALL_HEIGHT} as ways down, so asking to descend at least that far is what forces the
+     * path to contain a {@link MovementFall} at all. Aiming deeper than that is what makes the biggest reachable
+     * drop the cheapest route: a long fall costs a handful of ticks where the same descent by single steps costs
+     * roughly 8 ticks a block, so the pathfinder will happily walk a long way to an overhang. In the nether the
+     * lava ocean at y=31 is as deep as it is worth aiming, since anything that reaches it is already more runway
+     * than we need.
+     * <p>
+     * The level is always strictly below our feet. A goal we are already standing in is never pathed to at all
+     * ({@link baritone.behavior.PathingBehavior#secretInternalSetGoalAndPath}), which used to leave the process
+     * paused forever waiting on an executor that nothing was calculating - most easily hit by landing at exactly
+     * y=31 in the nether, where the old fixed {@code GoalYLevel(31)} was already satisfied.
+     */
+    private Goal takeoffGoal() {
+        return new TakeoffGoal(ctx.playerFeet().y, ctx.world().dimensionType().minY(), ctx.world().dimension() == Level.NETHER);
+    }
+
     public void landingSpotIsBad(BetterBlockPos endPos) {
         badLandingSpots.add(endPos);
         goingToLandingSpot = false;
@@ -352,6 +643,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private void destroyBehaviorAsync() {
         ElytraBehavior behavior = this.behavior;
         if (behavior != null) {
+            behavior.invalidate();
             this.behavior = null;
             Baritone.getExecutor().execute(() -> {
                 behavior.destroy();
@@ -397,7 +689,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     @Override
     public BlockPos currentDestination() {
-        return this.behavior != null ? this.behavior.destination : null;
+        return this.behavior != null ? this.behavior.destination : this.pendingDestination;
     }
 
     @Override
@@ -427,12 +719,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.allowTight = Baritone.settings().elytraAllowTightSpaces.value;
         this.allowAboveBuildLimit = Baritone.settings().elytraAllowAboveBuildLimit.value;
         this.allowAboveRoof = Baritone.settings().elytraAllowAboveRoof.value;
-        this.behavior = new ElytraBehavior(this.baritone, this, getNpfContext(), destination, appendDestination);
-
-        if (ctx.world() != null) {
-            this.repackChunks();
-        }
-        this.behavior.pathTo();
+        this.pendingDestination = destination.immutable();
+        this.pendingAppendDestination = appendDestination;
+        tryStartPendingFlight();
     }
 
     @Override
@@ -502,13 +791,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     @Override
     public boolean isSafeToCancel() {
-        return !this.isActive() || !(this.state == State.FLYING || this.state == State.START_FLYING);
+        return this.behavior == null || !(this.state == State.FLYING || this.state == State.START_FLYING || this.state == State.TAKEOFF_JUMP);
     }
 
     public enum State {
         LOCATE_JUMP("Finding spot to jump off"),
         PAUSE("Waiting for elytra path"),
         GET_TO_JUMP("Walking to takeoff"),
+        TAKEOFF_JUMP("Taking off"),
         START_FLYING("Begin flying"),
         FLYING("Flying"),
         LANDING("Landing");
@@ -527,9 +817,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     @Override
     public void onWorldEvent(WorldEvent event) {
-        if (event.getWorld() != null && event.getState() == EventState.POST) {
-            // Exiting the world, just destroy
-            destroyBehaviorAsync();
+        if (event.getState() == EventState.PRE) {
+            // Persistent caches belong to one world/dimension. Invalidate before the client swaps it.
+            onLostControl();
         }
     }
 
@@ -562,7 +852,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         public WalkOffCalculationContext(IBaritone baritone) {
             super(baritone, true);
             this.allowFallIntoLava = true;
-            this.minFallHeight = 8;
+            this.minFallHeight = TAKEOFF_MIN_FALL_HEIGHT;
             this.maxFallHeightNoWater = 10000;
         }
 
@@ -770,25 +1060,42 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
     }
 
-    private NetherPathfinderContext getNpfContext() {
-        if(this.npfContext == null) {
-            npfSema.acquireUninterruptibly();
-            this.npfContext = new NetherPathfinderContext(
-                    Baritone.settings().elytraNetherSeed.value,
-                    Baritone.settings().elytraUseCache.value ? baritone.getWorldProvider().getCurrentWorld().directory.resolve("cache") : null,
-                    ctx.world()
-            );
+    private void tryStartPendingFlight() {
+        if (this.pendingDestination == null || ctx.world() == null || ctx.player() == null) return;
+        if (this.npfContext == null) {
+            // The previous context may still be leaving a native search. Never block the game thread on
+            // its teardown: the active pending request is retried on the next process tick.
+            if (!this.npfSema.tryAcquire()) return;
+            try {
+                this.npfContext = new NetherPathfinderContext(
+                        Baritone.settings().elytraNetherSeed.value,
+                        Baritone.settings().elytraUseCache.value ? baritone.getWorldProvider().getCurrentWorld().directory.resolve("cache") : null,
+                        ctx.world()
+                );
+            } catch (RuntimeException | Error error) {
+                this.npfSema.release();
+                this.pendingDestination = null;
+                throw error;
+            }
         }
-        return this.npfContext;
+        final BlockPos destination = this.pendingDestination;
+        this.pendingDestination = null;
+        this.behavior = new ElytraBehavior(this.baritone, this, this.npfContext, destination, this.pendingAppendDestination);
+        this.repackChunks();
+        this.behavior.pathTo();
     }
 
     private void destroyNpfContextAsync() {
         NetherPathfinderContext npf = this.npfContext;
         if (npf != null) {
             this.npfContext = null;
+            npf.invalidate();
             Baritone.getExecutor().execute(() -> {
-                npf.destroy();
-                npfSema.release();
+                try {
+                    npf.destroy();
+                } finally {
+                    npfSema.release();
+                }
             });
         }
     }

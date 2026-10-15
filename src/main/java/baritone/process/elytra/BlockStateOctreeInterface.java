@@ -24,7 +24,7 @@ import net.minecraft.world.level.dimension.DimensionType;
 /**
  * @author Brady
  */
-public final class BlockStateOctreeInterface {
+final class BlockStateOctreeInterface {
 
     private final NetherPathfinderContext context;
     private final long contextPtr;
@@ -35,13 +35,16 @@ public final class BlockStateOctreeInterface {
     private int prevChunkX = Integer.MAX_VALUE;
     private int prevChunkZ = Integer.MAX_VALUE;
 
-    public BlockStateOctreeInterface(final NetherPathfinderContext context) {
+    BlockStateOctreeInterface(final NetherPathfinderContext context) {
         this.context = context;
         this.contextPtr = context.context;
         this.minY = context.minY;
     }
 
-    public boolean get0(final int x, final int y, final int z) {
+    boolean get0(final int x, final int y, final int z) {
+        if (!this.context.canAccessBlocks()) {
+            return true;
+        }
         final int adjustedY = y - this.minY;
         if (adjustedY < 0 || adjustedY > 383) {
             return false;

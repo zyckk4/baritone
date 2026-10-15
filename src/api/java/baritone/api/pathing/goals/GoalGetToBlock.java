@@ -62,6 +62,12 @@ public class GoalGetToBlock implements Goal, IGoalRenderPos {
     }
 
     @Override
+    public double heuristic() {
+        // Maximum heuristic among accepted adjacent positions, including the shifted lower layer.
+        return Math.max(GoalXZ.calculate(1, 0), Math.max(GoalYLevel.calculate(0, 1), GoalYLevel.calculate(0, -1)));
+    }
+
+    @Override
     public boolean equals(Object o) {
         if (this == o) {
             return true;

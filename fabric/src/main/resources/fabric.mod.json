@@ -3,15 +3,15 @@
   "id": "baritone",
   "version": "${version}",
 
-  "name": "Baritone",
-  "description": "Google Maps for Blockgame",
+  "name": "Baritone (2b2t fork)",
+  "description": "Official Minecraft 1.21.11 Baritone with selected Dekrom recovery improvements",
   "authors": [
-    "leijurv", "Brady"
+    "leijurv", "Brady", "Baritone contributors", "Dek", "zyckk4"
   ],
   "contact": {
-    "homepage": "https://github.com/cabaletta/baritone",
-    "sources": "https://github.com/cabaletta/baritone",
-    "issues": "https://github.com/cabaletta/baritone/issues"
+    "homepage": "https://github.com/zyckk4/baritone",
+    "sources": "https://github.com/zyckk4/baritone",
+    "issues": "https://github.com/zyckk4/baritone/issues"
   },
 
   "license": "LGPL-3.0",

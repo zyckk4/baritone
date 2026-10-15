@@ -40,7 +40,10 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.projectile.FireworkRocketEntity;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.ItemStack;
@@ -85,6 +88,7 @@ public final class ElytraBehavior implements Helper {
     public final PathManager pathManager;
     private final ElytraProcess process;
 
+    private static final int FIREWORK_COOLDOWN_TICKS = FireworkBoost.PENDING_BOOST_TICKS;
     /**
      * Remaining cool-down ticks between firework usage
      */
@@ -104,8 +108,7 @@ public final class ElytraBehavior implements Helper {
      */
     private int minimumBoostTicks;
 
-    private boolean deployedFireworkLastTick;
-    private final int[] nextTickBoostCounter;
+    private boolean fireworkSeenSinceLit = true;
 
     private BlockStateInterface bsi;
     public final BetterBlockPos destination;
@@ -115,6 +118,8 @@ public final class ElytraBehavior implements Helper {
     private Future<Solution> solver;
     private Solution pendingSolution;
     private boolean solveNextTick;
+    private boolean aimedThisTick;
+    private volatile boolean destroyed;
 
     private long timeLastCacheCull = 0L;
 
@@ -132,7 +137,6 @@ public final class ElytraBehavior implements Helper {
         this.destination = new BetterBlockPos(destination);
         this.appendDestination = appendDestination;
         this.solverExecutor = Executors.newSingleThreadExecutor();
-        this.nextTickBoostCounter = new int[2];
 
         this.npfContext = npf;
 
@@ -150,6 +154,7 @@ public final class ElytraBehavior implements Helper {
         public NetherPath path;
         private boolean completePath;
         private boolean recalculating;
+        private long generation;
 
         private int maxPlayerNear;
         private int ticksNearUnchanged;
@@ -201,7 +206,11 @@ public final class ElytraBehavior implements Helper {
                             logVerbose(String.format("Computed segment (Next %.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         }
                     })
-                    .whenComplete((result, ex) -> {
+                    .whenCompleteAsync((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
+                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                            return;
+                        }
                         this.recalculating = false;
                         if (ex != null) {
                             final Throwable cause = ex.getCause();
@@ -211,7 +220,7 @@ public final class ElytraBehavior implements Helper {
                                 logUnhandledException(cause);
                             }
                         }
-                    });
+                    }, ctx.minecraft()::execute);
         }
 
         public CompletableFuture<Void> pathRecalcSegment(final OptionalInt upToIncl) {
@@ -223,18 +232,24 @@ public final class ElytraBehavior implements Helper {
             final List<BetterBlockPos> after = upToIncl.isPresent() ? this.path.subList(upToIncl.getAsInt() + 1, this.path.size()) : Collections.emptyList();
             final boolean complete = this.completePath;
 
-            return this.path0(ctx.playerFeet(), upToIncl.isPresent() ? fixDestination(this.path.get(upToIncl.getAsInt())) : destinationFixed(), segment -> segment.append(after.stream(), complete || (segment.isFinished() && !upToIncl.isPresent())))
-                    .whenComplete((result, ex) -> {
+            return this.path0(ctx.playerFeet(), upToIncl.isPresent() ? fixDestination(this.path.get(upToIncl.getAsInt())) : destinationFixed(),
+                    segment -> segment.appendAfterRejoin(after.stream(), upToIncl.isPresent(), complete))
+                    .whenCompleteAsync((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
+                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                            return;
+                        }
                         this.recalculating = false;
                         if (ex != null) {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
-                                logDirect("Failed to recompute segment");
+                                logVerbose("Failed to recompute segment");
+                                repackNearPlayer("segment recomputation failed");
                             } else {
                                 logUnhandledException(cause);
                             }
                         }
-                    });
+                    }, ctx.minecraft()::execute);
         }
 
         public void pathNextSegment(final int afterIncl) {
@@ -258,12 +273,17 @@ public final class ElytraBehavior implements Helper {
                             logVerbose(String.format("Computed segment (Next %.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
                         }
                     })
-                    .whenComplete((result, ex) -> {
+                    .whenCompleteAsync((result, ex) -> {
+                        if (ElytraBehavior.this.destroyed || ex instanceof CancellationException
+                                || (ex != null && ex.getCause() instanceof CancellationException)) {
+                            return;
+                        }
                         this.recalculating = false;
                         if (ex != null) {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
-                                logDirect("Failed to compute next segment");
+                                logVerbose("Failed to compute next segment");
+                                repackNearPlayer("next segment computation failed");
                                 if (ctx.player().distanceToSqr(pathStart.getCenter()) < 16 * 16) {
                                     logVerbose("Player is near the segment start, therefore repeating this calculation is pointless. Marking as complete");
                                     completePath = true;
@@ -272,10 +292,11 @@ public final class ElytraBehavior implements Helper {
                                 logUnhandledException(cause);
                             }
                         }
-                    });
+                    }, ctx.minecraft()::execute);
         }
 
         public void clear() {
+            this.generation++;
             this.path = NetherPath.emptyPath();
             this.completePath = true;
             this.recalculating = false;
@@ -313,9 +334,21 @@ public final class ElytraBehavior implements Helper {
 
         // mickey resigned
         private CompletableFuture<Void> path0(BlockPos src, BlockPos dst, UnaryOperator<UnpackedSegment> operator) {
+            if (ElytraBehavior.this.destroyed) {
+                return CompletableFuture.failedFuture(new CancellationException("Elytra behavior stopped"));
+            }
+            final long request = ++this.generation;
             return ElytraBehavior.this.pathFinder.pathFindAsync(src, dst)
-                    .thenApply(operator)
-                    .thenAcceptAsync(this::setPath, ctx.minecraft()::execute);
+                    .handleAsync((segment, failure) -> {
+                        if (ElytraBehavior.this.destroyed || request != this.generation) {
+                            throw new CancellationException("Stale elytra path result");
+                        }
+                        if (failure != null) {
+                            throw failure instanceof CompletionException ? (CompletionException) failure : new CompletionException(failure);
+                        }
+                        this.setPath(operator.apply(segment));
+                        return null;
+                    }, ctx.minecraft()::execute);
         }
 
         // required read lock to be held
@@ -336,8 +369,25 @@ public final class ElytraBehavior implements Helper {
             }
             final BetterBlockPos rangeStart = path.get(rangeStartIncl);
             if (!ElytraBehavior.this.passable(rangeStart.x, rangeStart.y, rangeStart.z, false)) {
-                // we're in a wall
-                return; // previous iterations of this function SHOULD have fixed this by now :rage_cat:
+                // the node closest to us is now inside a block, so the terrain changed since this path was computed
+                final BetterBlockPos feet = ctx.playerFeet();
+                if (!ElytraBehavior.this.passable(feet.x, feet.y, feet.z, false)) {
+                    // we're inside a block ourselves, recalculating from here can't succeed. while flying that
+                    // means the cache is wrong about where we are, so refresh it
+                    repackNearPlayer("the cache has us inside a block");
+                    return;
+                }
+                int rejoin = rangeEndExcl - 1;
+                while (rejoin > rangeStartIncl && !ElytraBehavior.this.passable(path.get(rejoin).x, path.get(rejoin).y, path.get(rejoin).z, false)) {
+                    rejoin--;
+                }
+                final BetterBlockPos wallDest = destinationFixed();
+                final OptionalInt rejoinAt = rejoin > rangeStartIncl && path.get(rejoin).distanceSq(wallDest) < feet.distanceSq(wallDest)
+                        ? OptionalInt.of(rejoin)
+                        : OptionalInt.empty();
+                this.pathRecalcSegment(rejoinAt)
+                        .thenRun(() -> logVerbose("Recalculated segment, path node was inside a block"));
+                return;
             }
 
             if (ElytraBehavior.this.process.state != ElytraProcess.State.LANDING && this.ticksNearUnchanged > 100) {
@@ -471,10 +521,45 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onChunkEvent(ChunkEvent event) {
-        if (event.isPostPopulate() && this.npfContext != null) {
-            final LevelChunk chunk = ctx.world().getChunk(event.getX(), event.getZ());
-            npfContext.queueForPacking(chunk);
+        if (!this.destroyed && event.isPostPopulate() && this.npfContext != null) {
+            // Discarded packets can raise this event without a loaded chunk. Never cache their empty placeholder.
+            final LevelChunk chunk = ctx.world().getChunkSource().getChunk(event.getX(), event.getZ(), false);
+            if (chunk != null && !chunk.isEmpty()) {
+                npfContext.queueForPacking(chunk);
+            }
         }
+    }
+
+    private static final long REPACK_NEAR_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(2);
+    private long lastRepackNearNanos;
+
+    /** Refresh local terrain after a collision or a failed calculation exposes a stale native cache. */
+    private void repackNearPlayer(final String why) {
+        if (!ctx.minecraft().isSameThread()) {
+            ctx.minecraft().execute(() -> this.repackNearPlayer(why));
+            return;
+        }
+        if (this.destroyed || ctx.player() == null || ctx.world() == null) {
+            return;
+        }
+        final long now = System.nanoTime();
+        if (this.lastRepackNearNanos != 0 && now - this.lastRepackNearNanos < REPACK_NEAR_COOLDOWN_NANOS) {
+            return;
+        }
+        this.lastRepackNearNanos = now;
+        final BetterBlockPos feet = ctx.playerFeet();
+        final ChunkSource chunks = ctx.world().getChunkSource();
+        int packed = 0;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                final LevelChunk chunk = chunks.getChunk((feet.x >> 4) + dx, (feet.z >> 4) + dz, false);
+                if (chunk != null && !chunk.isEmpty()) {
+                    this.npfContext.queueForPacking(chunk);
+                    packed++;
+                }
+            }
+        }
+        logVerbose("Repacking " + packed + " chunks around the player: " + why);
     }
 
     public void onBlockChange(BlockChangeEvent event) {
@@ -495,19 +580,32 @@ public final class ElytraBehavior implements Helper {
         }
     }
 
-    public void destroy() {
+    /** Stop accepting work immediately, before asynchronous executor teardown begins. */
+    public void invalidate() {
+        this.destroyed = true;
+        this.solveNextTick = false;
         if (this.solver != null) {
             this.solver.cancel(true);
         }
-        this.solverExecutor.shutdown();
+        this.solverExecutor.shutdownNow();
+    }
+
+    public void destroy() {
+        this.invalidate();
         try {
-            while (!this.solverExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)) {}
+            this.solverExecutor.awaitTermination(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
         }
     }
 
     public void onTick() {
+        if (this.destroyed) {
+            return;
+        }
+        // These are game-tick clocks, not successful-cache-read clocks. Native searches can hold the
+        // write lock for seconds, but a pending rocket prediction must still expire after ten ticks.
+        this.updateTickState();
         if (npfContext.tryAcquireReadLock()) {
             try {
                 this.onTick0();
@@ -522,7 +620,9 @@ public final class ElytraBehavior implements Helper {
         }
     }
 
-    private void onTick0() {
+    private void updateTickState() {
+        this.solveNextTick = false;
+        this.aimedThisTick = false;
         // Fetch the previous solution, regardless of if it's going to be used
         this.pendingSolution = null;
         if (this.solver != null) {
@@ -543,14 +643,21 @@ public final class ElytraBehavior implements Helper {
 
         tickInventoryTransactions();
 
-        // Certified mojang employee incident
+        final boolean attachedFirework = this.getAttachedFirework().isPresent();
+        if (attachedFirework) {
+            this.fireworkSeenSinceLit = true;
+        }
         if (this.remainingFireworkTicks > 0) {
             this.remainingFireworkTicks--;
+            if (this.remainingFireworkTicks == 0 && !this.fireworkSeenSinceLit) {
+                logVerbose("No attached rocket observed within " + FIREWORK_COOLDOWN_TICKS + " ticks; pending boost prediction expired");
+            }
         }
         if (this.remainingSetBackTicks > 0) {
             this.remainingSetBackTicks--;
         }
-        if (!this.getAttachedFirework().isPresent()) {
+        if (!attachedFirework && this.remainingFireworkTicks <= 0) {
+            // nothing burning, and nothing lit recently enough for its entity to still be on its way from the server
             this.minimumBoostTicks = 0;
         }
 
@@ -561,6 +668,13 @@ public final class ElytraBehavior implements Helper {
         this.simulationLine = null;
         this.aimPos = null;
 
+        // ctx AND context???? :DDD
+        // Before the path check: everything the solver simulates goes through passable(), and the lava escape
+        // solves without a path
+        this.bsi = new BlockStateInterface(ctx);
+    }
+
+    private void onTick0() {
         final List<BetterBlockPos> path = this.pathManager.getPath();
         if (path.isEmpty()) {
             return;
@@ -569,8 +683,6 @@ public final class ElytraBehavior implements Helper {
             return;
         }
 
-        // ctx AND context???? :DDD
-        this.bsi = new BlockStateInterface(ctx);
         this.pathManager.tick();
 
         final int playerNear = this.pathManager.getNear();
@@ -584,16 +696,27 @@ public final class ElytraBehavior implements Helper {
      * Called by {@link baritone.process.ElytraProcess#onTick(boolean, boolean)} when the process is in control and the player is flying
      */
     public void tick() {
-        if (this.pathManager.getPath().isEmpty()) {
+        this.aimedThisTick = false;
+        if (this.destroyed) {
+            return;
+        }
+        final boolean inLava = ctx.player().isInLava();
+        if (this.pathManager.getPath().isEmpty() && !inLava) {
             return;
         }
         trySwapElytra();
 
         if (ctx.player().horizontalCollision) {
             logVerbose("hbonk");
+            // the simulation never flies into anything it knows about, so this is something it didn't
+            repackNearPlayer("hit something the cache didn't know about");
         }
         if (ctx.player().verticalCollision) {
             logVerbose("vbonk");
+        }
+        if (this.bsi == null) {
+            // The behavior was created after this tick's update; no collision view is available yet.
+            return;
         }
 
         final SolverContext solverContext = this.new SolverContext(false);
@@ -607,12 +730,6 @@ public final class ElytraBehavior implements Helper {
             solution = this.solveAngles(solverContext);
         }
 
-        if (this.deployedFireworkLastTick) {
-            this.nextTickBoostCounter[solverContext.boost.isBoosted() ? 1 : 0]++;
-            this.deployedFireworkLastTick = false;
-        }
-
-        final boolean inLava = ctx.player().isInLava();
         if (inLava) {
             baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
         }
@@ -623,9 +740,10 @@ public final class ElytraBehavior implements Helper {
         }
 
         baritone.getLookBehavior().updateTarget(solution.rotation, false);
+        this.aimedThisTick = true;
 
         if (!solution.solvedPitch) {
-            logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
+            logVerbose("Using collision-avoidance pitch while the path is unavailable");
             return;
         } else {
             this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
@@ -635,20 +753,29 @@ public final class ElytraBehavior implements Helper {
                 solution.context.start,
                 solution.goingTo,
                 solution.context.boost.isBoosted(),
-                solution.forceUseFirework || inLava
+                solution.forceUseFirework || inLava,
+                inLava
         );
     }
 
     public void onPostTick(TickEvent event) {
-        if (event.getType() == TickEvent.Type.IN && this.solveNextTick) {
+        if (!this.destroyed && event.getType() == TickEvent.Type.IN && this.solveNextTick) {
             // We're at the end of the tick, the player's position likely updated and the closest path node could've
             // changed. Updating it now will avoid unnecessary recalculation on the main thread.
             this.pathManager.updatePlayerNear();
 
             final SolverContext context = this.new SolverContext(true);
+            // Lava escape reads live collision shapes. Keep that work on the game thread.
+            if (context.ignoreLava) {
+                this.solveNextTick = false;
+                return;
+            }
             this.solver = this.solverExecutor.submit(() -> {
                 npfContext.acquireReadLock();
                 try {
+                    if (this.destroyed || Thread.currentThread().isInterrupted()) {
+                        return null;
+                    }
                     return this.solveAngles(context);
                 } finally {
                     npfContext.releaseReadLock();
@@ -660,8 +787,14 @@ public final class ElytraBehavior implements Helper {
 
     // calls passable which requires a read lock
     private Solution solveAngles(final SolverContext context) {
+        if (this.destroyed || Thread.currentThread().isInterrupted()) {
+            return null;
+        }
+        if (context.ignoreLava) {
+            return this.solveLavaEscape(context);
+        }
         final NetherPath path = context.path;
-        final int playerNear = landingMode ? path.size() - 1 : context.playerNear;
+        final int playerNear = context.landingMode ? path.size() - 1 : context.playerNear;
         final Vec3 start = context.start;
         Solution solution = null;
 
@@ -671,8 +804,8 @@ public final class ElytraBehavior implements Helper {
             //int minStep = Math.max(0, playerNear - relaxation);
             int minStep = playerNear;
 
-            for (int i = Math.min(playerNear + 20, path.size() - 1); i >= minStep; i--) {
-                if (Thread.interrupted()) return null; // cancelled by the game thread
+            for (int i = playerNear + Math.min(Math.max(1, Baritone.settings().elytraPathLookahead.value), path.size() - 1 - playerNear); i >= minStep; i--) {
+                if (Thread.currentThread().isInterrupted()) return null; // cancelled by the game thread
                 final List<Pair<Vec3, Integer>> candidates = new ArrayList<>();
                 for (int dy : heights) {
                     if (relaxation == 0 || i == minStep) {
@@ -702,7 +835,7 @@ public final class ElytraBehavior implements Helper {
                 for (final Pair<Vec3, Integer> candidate : candidates) {
                     final Integer augment = candidate.second();
                     Vec3 dest = candidate.first().add(0, augment, 0);
-                    if (landingMode) {
+                    if (context.landingMode) {
                         dest = dest.add(0.5, 0.5, 0.5);
                     }
 
@@ -730,11 +863,11 @@ public final class ElytraBehavior implements Helper {
 
                     if (this.isHitboxClear(context, dest, growth)) {
                         // Yaw is trivial, just calculate the rotation required to face the destination
-                        final float yaw = RotationUtils.calcRotationFromVec3d(start, dest, ctx.playerRotations()).getYaw();
+                        final float yaw = RotationUtils.calcRotationFromVec3d(start, dest, context.rotation).getYaw();
 
                         final Pair<Float, Boolean> pitch = this.solvePitch(context, dest, relaxation);
                         if (pitch == null) {
-                            solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, false);
+                            solution = new Solution(context, new Rotation(yaw, context.rotation.getPitch()), null, false, false);
                             continue;
                         }
 
@@ -744,15 +877,118 @@ public final class ElytraBehavior implements Helper {
                 }
             }
         }
-        return solution;
+        return this.solveSurvival(context, solution);
     }
 
-    private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final boolean forceUseFirework) {
-        if (this.remainingSetBackTicks > 0) {
+    /**
+     * In lava the elytra is inert: vanilla moves us by the fluid rules whenever we are in one, glide or not, so
+     * the only thrust is the rocket, at a fraction of its usual push, and the pool is walled in a few blocks
+     * away on every side. Aiming at the path would spend the rocket pushing against basalt. The way out is up:
+     * the steepest climb the simulation keeps clear, and a rocket, every time. Works without a path, since a
+     * lava takeoff may still be waiting for its first one.
+     */
+    private Solution solveLavaEscape(final SolverContext context) {
+        final NetherPath path = context.path;
+        // yaw is irrelevant to a vertical rocket; face where we are going so that the climb comes out pointed
+        // along the path once the normal solver takes over
+        final Vec3 towards = path.isEmpty()
+                ? Vec3.atCenterOf(this.destination)
+                : path.getVec(Math.min(context.playerNear + 1, path.size() - 1));
+        final float yaw = RotationUtils.calcRotationFromVec3d(context.start, towards, context.rotation).getYaw();
+        final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
+        // simulate with a rocket burning whether or not one is yet: the escape needs one, and tick() lights it
+        final int ticksBoosted = context.boost.isBoosted() ? Math.max(1, context.boost.getGuaranteedBoostTicks()) : 10;
+        final int ticksBoostDelay = context.boost.isBoosted() ? 0 : 2;
+        final PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, ticksBoostDelay);
+        if (best == null) {
+            return null; // cancelled by the game thread
+        }
+        this.simulationLine = best.steps;
+        final Vec3 last = best.steps.get(best.steps.size() - 1);
+        return new Solution(context, new Rotation(yaw, best.pitch), context.start.add(last), true, true);
+    }
+
+    /**
+     * Last resort when no pitch reaches the path (e.g. the terrain changed and the goal is now walled off):
+     * fly the pitch that stays collision-free the longest, biased towards climbing, so that the path
+     * recalculation has time to catch up. If an impact is imminent and a firework would provably extend
+     * survival, one is forced.
+     */
+    private Solution solveSurvival(final SolverContext context, final Solution unsolved) {
+        if (context.landingMode) {
+            return unsolved;
+        }
+        final float yaw = unsolved != null ? unsolved.rotation.getYaw() : context.rotation.getYaw();
+        final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
+        final int ticksBoosted = context.boost.isBoosted() ? Math.max(1, context.boost.getGuaranteedBoostTicks()) : 0;
+
+        final PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, 0);
+        if (best == null) { // cancelled by the game thread
+            return unsolved;
+        }
+
+        final int survivedTicks = best.steps.size() - 1;
+        // No pitch keeps us clear for the whole horizon, or we are in lava: if a rocket lit now would provably
+        // do better, light one. This used to wait until the impact was a dozen ticks out, which from the top of
+        // a climb out of a hole meant falling most of the way back in before doing anything about it.
+        final boolean impactAhead = survivedTicks < ticks;
+        if ((impactAhead || context.ignoreLava) && !context.boost.isBoosted() && context.hasFireworks) {
+            final PitchResult boosted = this.solveSurvivalPitch(context, yaw, ticks, 10, 2);
+            if (boosted != null && (boosted.steps.size() > best.steps.size() + 2
+                    || (context.ignoreLava && boosted.steps.size() >= best.steps.size()))) {
+                final Vec3 last = boosted.steps.get(boosted.steps.size() - 1);
+                this.simulationLine = boosted.steps;
+                return new Solution(context, new Rotation(yaw, boosted.pitch), context.start.add(last), true, true);
+            }
+        }
+
+        this.simulationLine = best.steps;
+        return new Solution(context, new Rotation(yaw, best.pitch), null, false, false);
+    }
+
+    private PitchResult solveSurvivalPitch(final SolverContext context, final float yaw, final int ticks,
+                                           final int ticksBoosted, final int ticksBoostDelay) {
+        final float yawRadians = yaw * RotationUtils.DEG_TO_RAD_F;
+        // a goal far along the direction we are about to face, so that the simulated yaw stays fixed
+        final Vec3 direction = new Vec3(-Mth.sin(yawRadians) * 1e4, 0, Mth.cos(yawRadians) * 1e4);
+        final float currentPitch = context.rotation.getPitch();
+
+        PitchResult best = null;
+        // scan the climbing side (negative pitch) first; new walls are usually escapable from above. With a
+        // rocket burning, don't settle for the first pitch that survives: take the one that ends highest. The
+        // boost is the one chance to get above whatever is boxing us in, and straight up is where that is most
+        // likely to be clear (the hole we just took off from, a crevice, the hollow beside a lava pond).
+        final boolean preferHeight = ticksBoosted > 0;
+        for (float pitch = currentPitch; pitch >= -90; pitch -= 3) {
+            if (Thread.currentThread().isInterrupted()) return null;
+            best = this.betterSurvival(context, direction, pitch, ticks, ticksBoosted, ticksBoostDelay, best);
+            if (!preferHeight && best != null && best.steps.size() - 1 >= ticks) return best;
+        }
+        if (best != null && best.steps.size() - 1 >= ticks) return best;
+        for (float pitch = currentPitch + 3; pitch <= 90; pitch += 3) {
+            if (Thread.currentThread().isInterrupted()) return null;
+            best = this.betterSurvival(context, direction, pitch, ticks, ticksBoosted, ticksBoostDelay, best);
+            if (best != null && best.steps.size() - 1 >= ticks) return best;
+        }
+        return best;
+    }
+
+    private PitchResult betterSurvival(final SolverContext context, final Vec3 direction, final float pitch,
+                                       final int ticks, final int ticksBoosted, final int ticksBoostDelay,
+                                       final PitchResult best) {
+        final List<Vec3> steps = this.simulate(context, direction, pitch, ticks, ticksBoosted, ticksBoostDelay, true);
+        // longer survival wins; on equal survival prefer the trajectory that ends higher up
+        final double score = (steps.size() - 1) * 1000.0 + steps.get(steps.size() - 1).y;
+        return best == null || score > best.dot ? new PitchResult(pitch, score, steps) : best;
+    }
+
+    private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final boolean forceUseFirework, final boolean inLava) {
+        // neither the setback delay nor a landing in progress is a reason to keep burning
+        if (this.remainingSetBackTicks > 0 && !inLava) {
             logDebug("waiting for elytraFireworkSetbackUseDelay: " + this.remainingSetBackTicks);
             return;
         }
-        if (this.landingMode) {
+        if (this.landingMode && !inLava) {
             return;
         }
         final boolean useOnDescend = !Baritone.settings().elytraConserveFireworks.value || ctx.player().position().y < goingTo.y + 5;
@@ -769,19 +1005,76 @@ public final class ElytraBehavior implements Helper {
                 && (ctx.player().position().y < goingTo.y - 5 || start.distanceTo(new Vec3(goingTo.x + 0.5, ctx.player().position().y, goingTo.z + 0.5)) > 5) // UGH!!!!!!!
                 && currentSpeed < elytraFireworkSpeed * elytraFireworkSpeed))
         ) {
-            // Prioritize boosting fireworks over regular ones
-            // TODO: Take the minimum boost time into account?
-            if (!baritone.getInventoryBehavior().throwaway(true, ElytraBehavior::isBoostingFireworks) &&
-                    !baritone.getInventoryBehavior().throwaway(true, ElytraBehavior::isFireworks)) {
-                logDirect("no fireworks");
-                return;
-            }
             logVerbose("attempting to use firework" + (forceUseFirework ? " (forced)" : ""));
-            ctx.playerController().processRightClick(ctx.player(), ctx.world(), InteractionHand.MAIN_HAND);
-            this.minimumBoostTicks = 10 * (1 + getFireworkBoost(ctx.player().getItemInHand(InteractionHand.MAIN_HAND)).orElse(0));
-            this.remainingFireworkTicks = 10;
-            this.deployedFireworkLastTick = true;
+            this.useFirework();
         }
+    }
+
+    /**
+     * Lights a firework to get off the ground, for an elytra that was opened from a standing jump instead of a
+     * fall. There is no speed and only a couple of blocks of air to work with, so this can't wait for the solver
+     * to decide that a boost is warranted.
+     *
+     * @return {@code true} if a rocket is attached, recently predicted, or locally used successfully
+     */
+    public boolean useFireworkForTakeoff() {
+        if (this.destroyed || !ctx.player().isFallFlying()) {
+            return false;
+        }
+        if (this.remainingFireworkTicks > 0 || this.getAttachedFirework().isPresent()) {
+            return true;
+        }
+        return this.aimedThisTick && this.useFirework();
+    }
+
+    /**
+     * @return {@code true} if the local interaction succeeded; server acceptance is observed separately
+     */
+    private boolean useFirework() {
+        // the main hand is what processRightClick uses, and selectFirework settles for putting something harmless
+        // there when the only firework we have is in the off hand, which would right click nothing at all
+        if (!this.selectFirework() || !isFireworks(ctx.player().getItemInHand(InteractionHand.MAIN_HAND))) {
+            logVerbose("no fireworks in the main hand");
+            return false;
+        }
+        // The use packet carries a look of its own, read off the player as it is built, and the server-side
+        // movement check compares it with the look in this tick's movement packet: the rotation LookBehavior
+        // is about to apply for the solver's target, not what the player is facing right now. Face that for
+        // the duration of the click so the two agree; the look behavior sets or restores the real rotation
+        // later in the tick regardless.
+        final int boostTicks = 10 * (1 + getFireworkBoost(ctx.player().getItemInHand(InteractionHand.MAIN_HAND)).orElse(0));
+        final Rotation wire = this.baritone.getLookBehavior().getRotationForThisTick();
+        final float yaw = ctx.player().getYRot();
+        final float pitch = ctx.player().getXRot();
+        ctx.player().setYRot(wire.getYaw());
+        ctx.player().setXRot(wire.getPitch());
+        try {
+            if (!(ctx.playerController().processRightClick(ctx.player(), ctx.world(), InteractionHand.MAIN_HAND)
+                    instanceof InteractionResult.Success)) {
+                return false;
+            }
+        } finally {
+            ctx.player().setYRot(yaw);
+            ctx.player().setXRot(pitch);
+        }
+        this.minimumBoostTicks = boostTicks;
+        this.remainingFireworkTicks = FIREWORK_COOLDOWN_TICKS;
+        this.fireworkSeenSinceLit = false;
+        return true;
+    }
+
+    /**
+     * Puts a firework in the main hand. Picking one that is already in the hotbar is instant, but bringing one up
+     * from the rest of the inventory is a window click, and those only happen while stationary, so a takeoff has
+     * to call this before leaving the ground.
+     *
+     * @return {@code true} if the main hand now holds a firework
+     */
+    public boolean selectFirework() {
+        // Prioritize boosting fireworks over regular ones
+        // TODO: Take the minimum boost time into account?
+        return baritone.getInventoryBehavior().throwaway(true, ElytraBehavior::isBoostingFireworks)
+                || baritone.getInventoryBehavior().throwaway(true, ElytraBehavior::isFireworks);
     }
 
     private final class SolverContext {
@@ -790,8 +1083,13 @@ public final class ElytraBehavior implements Helper {
         public final int playerNear;
         public final Vec3 start;
         public final Vec3 motion;
+        public final Rotation rotation;
         public final AABB boundingBox;
         public final boolean ignoreLava;
+        public final boolean landingMode;
+        public final double gravity;
+        public final boolean slowFalling;
+        public final boolean hasFireworks;
         public final FireworkBoost boost;
         public final IAimProcessor aimProcessor;
 
@@ -807,16 +1105,24 @@ public final class ElytraBehavior implements Helper {
 
             this.start = ctx.playerFeetAsVec();
             this.motion = ctx.playerMotion();
+            this.rotation = ctx.playerRotations();
             this.boundingBox = ctx.player().getBoundingBox();
             this.ignoreLava = ctx.player().isInLava();
-
-            final Integer fireworkTicksExisted;
-            if (async && ElytraBehavior.this.deployedFireworkLastTick) {
-                final int[] counter = ElytraBehavior.this.nextTickBoostCounter;
-                fireworkTicksExisted = counter[1] > counter[0] ? 0 : null;
-            } else {
-                fireworkTicksExisted = ElytraBehavior.this.getAttachedFirework().map(e -> e.tickCount).orElse(null);
+            this.landingMode = ElytraBehavior.this.landingMode;
+            this.gravity = ctx.player().isNoGravity() ? 0 : ctx.player().getAttributeValue(Attributes.GRAVITY);
+            this.slowFalling = ctx.player().hasEffect(MobEffects.SLOW_FALLING);
+            boolean fireworks = false;
+            for (ItemStack stack : ctx.player().getInventory().getNonEquipmentItems()) {
+                if (isFireworks(stack)) {
+                    fireworks = true;
+                    break;
+                }
             }
+            this.hasFireworks = fireworks;
+
+            final Integer fireworkTicksExisted = FireworkBoost.predictAge(
+                    ElytraBehavior.this.getAttachedFirework().map(e -> e.tickCount).orElse(null),
+                    ElytraBehavior.this.remainingFireworkTicks, async);
             this.boost = new FireworkBoost(fireworkTicksExisted, ElytraBehavior.this.minimumBoostTicks);
 
             ITickableAimProcessor aim = ElytraBehavior.this.baritone.getLookBehavior().getAimProcessor().fork();
@@ -841,66 +1147,15 @@ public final class ElytraBehavior implements Helper {
                     && this.playerNear == other.playerNear
                     && Objects.equals(this.start, other.start)
                     && Objects.equals(this.motion, other.motion)
+                    && this.rotation.getYaw() == other.rotation.getYaw()
+                    && this.rotation.getPitch() == other.rotation.getPitch()
                     && Objects.equals(this.boundingBox, other.boundingBox)
                     && this.ignoreLava == other.ignoreLava
+                    && this.landingMode == other.landingMode
+                    && this.gravity == other.gravity
+                    && this.slowFalling == other.slowFalling
+                    && this.hasFireworks == other.hasFireworks
                     && Objects.equals(this.boost, other.boost);
-        }
-    }
-
-    private static final class FireworkBoost {
-
-        private final Integer fireworkTicksExisted;
-        private final int minimumBoostTicks;
-        private final int maximumBoostTicks;
-
-        /**
-         * @param fireworkTicksExisted The ticksExisted of the attached firework entity, or {@code null} if no entity.
-         * @param minimumBoostTicks    The minimum number of boost ticks that the attached firework entity, if any, will
-         *                             provide.
-         */
-        public FireworkBoost(final Integer fireworkTicksExisted, final int minimumBoostTicks) {
-            this.fireworkTicksExisted = fireworkTicksExisted;
-
-            // this.lifetime = 10 * i + this.rand.nextInt(6) + this.rand.nextInt(7);
-            this.minimumBoostTicks = minimumBoostTicks;
-            this.maximumBoostTicks = minimumBoostTicks + 11;
-        }
-
-        public boolean isBoosted() {
-            return this.fireworkTicksExisted != null;
-        }
-
-        /**
-         * @return The guaranteed number of remaining ticks with boost
-         */
-        public int getGuaranteedBoostTicks() {
-            return this.isBoosted() ? Math.max(0, this.minimumBoostTicks - this.fireworkTicksExisted) : 0;
-        }
-
-        /**
-         * @return The maximum number of remaining ticks with boost
-         */
-        public int getMaximumBoostTicks() {
-            return this.isBoosted() ? Math.max(0, this.maximumBoostTicks - this.fireworkTicksExisted) : 0;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || o.getClass() != FireworkBoost.class) {
-                return false;
-            }
-
-            FireworkBoost other = (FireworkBoost) o;
-            if (!this.isBoosted() && !other.isBoosted()) {
-                return true;
-            }
-
-            return Objects.equals(this.fireworkTicksExisted, other.fireworkTicksExisted)
-                    && this.minimumBoostTicks == other.minimumBoostTicks
-                    && this.maximumBoostTicks == other.maximumBoostTicks;
         }
     }
 
@@ -1067,7 +1322,7 @@ public final class ElytraBehavior implements Helper {
 
     private Pair<Float, Boolean> solvePitch(final SolverContext context, final Vec3 goal, final int relaxation) {
         final boolean desperate = relaxation == 2;
-        final float goodPitch = RotationUtils.calcRotationFromVec3d(context.start, goal, ctx.playerRotations()).getPitch();
+        final float goodPitch = RotationUtils.calcRotationFromVec3d(context.start, goal, context.rotation).getPitch();
         final FloatArrayList pitches = pitchesToSolveFor(goodPitch, desperate);
 
         final IntTriFunction<PitchResult> solve = (ticks, ticksBoosted, ticksBoostDelay) ->
@@ -1134,6 +1389,9 @@ public final class ElytraBehavior implements Helper {
         final Deque<PitchResult> bestResults = new ArrayDeque<>();
 
         while (pitches.hasNext()) {
+            if (this.destroyed || Thread.currentThread().isInterrupted()) {
+                return null;
+            }
             final float pitch = pitches.nextFloat();
             final List<Vec3> displacement = this.simulate(
                     context,
@@ -1141,14 +1399,15 @@ public final class ElytraBehavior implements Helper {
                     pitch,
                     ticks,
                     ticksBoosted,
-                    ticksBoostDelay
+                    ticksBoostDelay,
+                    false
             );
             if (displacement == null) {
                 continue;
             }
             final Vec3 last = displacement.get(displacement.size() - 1);
             double goodness = goalDirection.dot(last.normalize());
-            if (landingMode) {
+            if (context.landingMode) {
                 goodness = -goalDelta.subtract(last).length();
             }
             final PitchResult bestSoFar = bestResults.peek();
@@ -1181,7 +1440,7 @@ public final class ElytraBehavior implements Helper {
     }
 
     private List<Vec3> simulate(final SolverContext context, final Vec3 goalDelta, final float pitch, final int ticks,
-                                final int ticksBoosted, final int ticksBoostDelay) {
+                                final int ticksBoosted, final int ticksBoostDelay, final boolean stopOnImpact) {
         final ITickableAimProcessor aimProcessor = context.aimProcessor.fork();
         Vec3 delta = goalDelta;
         Vec3 motion = context.motion;
@@ -1191,17 +1450,20 @@ public final class ElytraBehavior implements Helper {
         int remainingTicksBoosted = ticksBoosted;
 
         for (int i = 0; i < ticks; i++) {
+            if (this.destroyed || Thread.currentThread().isInterrupted()) {
+                return stopOnImpact ? displacement : null;
+            }
             final double cx = hitbox.minX + (hitbox.maxX - hitbox.minX) * 0.5D;
             final double cz = hitbox.minZ + (hitbox.maxZ - hitbox.minZ) * 0.5D;
             if (delta.lengthSqr() < 1) {
                 break;
             }
             final Rotation rotation = aimProcessor.nextRotation(
-                    RotationUtils.calcRotationFromVec3d(Vec3.ZERO, delta, ctx.playerRotations()).withPitch(pitch)
+                    RotationUtils.calcRotationFromVec3d(Vec3.ZERO, delta, context.rotation).withPitch(pitch)
             );
             final Vec3 lookDirection = RotationUtils.calcLookDirectionFromRotation(rotation);
 
-            motion = step(motion, lookDirection, rotation.getPitch());
+            motion = ElytraFlightPhysics.step(motion, lookDirection, rotation.getPitch(), context.gravity, context.slowFalling);
             delta = delta.subtract(motion);
 
             // Collision box while the player is in motion, with additional padding for safety
@@ -1220,7 +1482,8 @@ public final class ElytraBehavior implements Helper {
                 for (int y = ymin; y < ymax; y++) {
                     for (int z = zmin; z < zmax; z++) {
                         if (!this.passable(x, y, z, context.ignoreLava)) {
-                            return null;
+                            // displacement only covers the ticks before the impact
+                            return stopOnImpact ? displacement : null;
                         }
                     }
                 }
@@ -1240,45 +1503,6 @@ public final class ElytraBehavior implements Helper {
         }
 
         return displacement;
-    }
-
-    private static Vec3 step(final Vec3 motion, final Vec3 lookDirection, final float pitch) {
-        double motionX = motion.x;
-        double motionY = motion.y;
-        double motionZ = motion.z;
-
-        float pitchRadians = pitch * RotationUtils.DEG_TO_RAD_F;
-        double pitchBase2 = Math.sqrt(lookDirection.x * lookDirection.x + lookDirection.z * lookDirection.z);
-        double flatMotion = Math.sqrt(motionX * motionX + motionZ * motionZ);
-        double thisIsAlwaysOne = lookDirection.length();
-        float pitchBase3 = Mth.cos(pitchRadians);
-        //System.out.println("always the same lol " + -pitchBase + " " + pitchBase3);
-        //System.out.println("always the same lol " + Math.abs(pitchBase3) + " " + pitchBase2);
-        //System.out.println("always 1 lol " + thisIsAlwaysOne);
-        pitchBase3 = (float) ((double) pitchBase3 * (double) pitchBase3 * Math.min(1, thisIsAlwaysOne / 0.4));
-        motionY += -0.08 + (double) pitchBase3 * 0.06;
-        if (motionY < 0 && pitchBase2 > 0) {
-            double speedModifier = motionY * -0.1 * (double) pitchBase3;
-            motionY += speedModifier;
-            motionX += lookDirection.x * speedModifier / pitchBase2;
-            motionZ += lookDirection.z * speedModifier / pitchBase2;
-        }
-        if (pitchRadians < 0) { // if you are looking down (below level)
-            double anotherSpeedModifier = flatMotion * (double) (-Mth.sin(pitchRadians)) * 0.04;
-            motionY += anotherSpeedModifier * 3.2;
-            motionX -= lookDirection.x * anotherSpeedModifier / pitchBase2;
-            motionZ -= lookDirection.z * anotherSpeedModifier / pitchBase2;
-        }
-        if (pitchBase2 > 0) { // this is always true unless you are looking literally straight up (let's just say the bot will never do that)
-            motionX += (lookDirection.x / pitchBase2 * flatMotion - motionX) * 0.1;
-            motionZ += (lookDirection.z / pitchBase2 * flatMotion - motionZ) * 0.1;
-        }
-        motionX *= 0.99f;
-        motionY *= 0.98f;
-        motionZ *= 0.99f;
-        //System.out.println(motionX + " " + motionY + " " + motionZ);
-
-        return new Vec3(motionX, motionY, motionZ);
     }
 
     // any call to this must be done with the lock held

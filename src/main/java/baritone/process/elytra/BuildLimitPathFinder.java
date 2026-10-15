@@ -21,7 +21,6 @@ import baritone.Baritone;
 import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.IPlayerContext;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Vec3i;
 import net.minecraft.util.Tuple;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -63,6 +62,11 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
      * @return A tuple containing the path as a list of BetterBlockPos and a boolean indicating if the path is complete
      */
     public Tuple<List<BetterBlockPos>, Boolean> generateDirectPath(BetterBlockPos start, BetterBlockPos destination, int bufferDistance, int maxPathSize) {
+        return generateDirectPath(start, destination, bufferDistance, maxPathSize, this.flightLevel);
+    }
+
+    static Tuple<List<BetterBlockPos>, Boolean> generateDirectPath(BetterBlockPos start, BetterBlockPos destination,
+                                                                  int bufferDistance, int maxPathSize, int flightLevel) {
         final LinkedList<BetterBlockPos> path = new LinkedList<>();
         final int stepDistance = 32;
 
@@ -78,7 +82,7 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
             double remainingDistance = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
             double remainingDistanceSq = deltaX * deltaX + deltaZ * deltaZ;
 
-            if(remainingDistanceSq <= bufferDistance * bufferDistance) {
+            if(remainingDistanceSq <= (double) bufferDistance * bufferDistance) {
                 // We are within the buffer distance, so we can stop here
                 return new Tuple<>(path, true);
             } else if (remainingDistance <= stepDistance) {
@@ -97,6 +101,13 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
         return new Tuple<>(path, false);
     }
 
+    static UnpackedSegment fallbackDescentPath(BlockPos start, BlockPos destination, int flightLevel) {
+        var directPath = generateDirectPath(new BetterBlockPos(start), new BetterBlockPos(destination), 0, 2, flightLevel);
+        // Reaching the target X/Z above the build limit does not finish a goal below it. Keep extending
+        // the path until a clear descent is available instead of stitching in an unchecked vertical leg.
+        return new UnpackedSegment(directPath.getA().stream(), false);
+    }
+
     /**
      * Attempts to find an open spot in the sky to transition up above the build limit so a simple direct path can be followed
      * @param start
@@ -104,14 +115,6 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
      * @return A tuple containing the path that transitions above build limit and a boolean indicating if a transition was found
      */
     public Tuple<List<BetterBlockPos>,Boolean> generateTransitionUp(BetterBlockPos start, BetterBlockPos destination) {
-        final double deltaX = destination.getX() - start.getX();
-        final double deltaZ = destination.getZ() - start.getZ();
-        final double distance = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
-
-        final double scale = 8 / distance;
-        final double stepX = deltaX * scale;
-        final double stepZ = deltaZ * scale;
-
         final int netherMaxHeight = netherCtx.getMaxHeight() + playerCtx.world().getMinY() - 1;
 
         final ChunkPos startChunk = new ChunkPos(start.x >> 4, start.z >> 4);
@@ -122,19 +125,26 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
 
         LinkedList<BetterBlockPos> path = new LinkedList<>();
 
-        // Start with the middle block so the transition doesn't leave the only chunk we can confirm is clear
-        final BlockPos middlePos = startChunk.getMiddleBlockPosition(netherMaxHeight+4);
-
-        for(int i = 2; i <= 2; i++) {
-            BetterBlockPos next = new BetterBlockPos(
-                    (int) (middlePos.getX() + (stepX * i)),
-                    netherMaxHeight + (i * 8),
-                    (int) (middlePos.getZ() + (stepZ * i))
-            );
-            path.add(next);
-        }
+        path.add(transitionUpWaypoint(start, destination, netherMaxHeight));
 
         return new Tuple<>(path, true);
+    }
+
+    /** Geometry only, so a vertical goal cannot turn 0 * infinity into world-origin coordinates. */
+    static BetterBlockPos transitionUpWaypoint(BlockPos start, BlockPos destination, int maxHeight) {
+        final double deltaX = (double) destination.getX() - start.getX();
+        final double deltaZ = (double) destination.getZ() - start.getZ();
+        final double distance = Math.hypot(deltaX, deltaZ);
+        final double scale = distance == 0 ? 0 : 16 / distance;
+        final BlockPos middle = new ChunkPos(start).getMiddleBlockPosition(maxHeight + 16);
+        return new BetterBlockPos((int) (middle.getX() + deltaX * scale), maxHeight + 16,
+                (int) (middle.getZ() + deltaZ * scale));
+    }
+
+    static boolean isBeyondHorizontalDistance(BlockPos start, BlockPos destination, double threshold) {
+        final double deltaX = (double) destination.getX() - start.getX();
+        final double deltaZ = (double) destination.getZ() - start.getZ();
+        return deltaX * deltaX + deltaZ * deltaZ > threshold * threshold;
     }
 
     /**
@@ -181,8 +191,7 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
         // There can be some navigation issues around failed transitions if the threshold distance isn't large enough
         final double maxDistance = Baritone.settings().elytraLongDistanceThreshold.value >= 32 ? (double) Baritone.settings().elytraLongDistanceThreshold.value : Double.POSITIVE_INFINITY;
 
-        final double distanceXZ = src.distSqr(new Vec3i(dst.getX(), src.getY(), dst.getZ()));
-        final boolean isLongDistance = distanceXZ > maxDistance * maxDistance;
+        final boolean isLongDistance = isBeyondHorizontalDistance(src, dst, maxDistance);
         final boolean srcAboveSupportedHeight = src.getY() >= netherMaxHeight;
         final boolean dstAboveSupportedHeight = dst.getY() >= netherMaxHeight;
 
@@ -234,9 +243,7 @@ public class BuildLimitPathFinder implements IElytraPathFinder {
                 boolean success = transition.getB();
 
                 if(!success) {
-                    BetterBlockPos newDest = distanceXZ > 32 ? new BetterBlockPos(dst) : new BetterBlockPos(dst.getX(), playerCtx.world().getMaxY(), dst.getZ());
-                    var directPath = generateDirectPath(new BetterBlockPos(src), newDest, 0, 2);
-                    return CompletableFuture.completedFuture(new UnpackedSegment(directPath.getA().stream(), directPath.getB()));
+                    return CompletableFuture.completedFuture(fallbackDescentPath(src, dst, this.flightLevel));
                 }
 
                 return CompletableFuture.supplyAsync(() -> {
